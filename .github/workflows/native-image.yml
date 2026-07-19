@@ -61,6 +61,9 @@ jobs:
       - name: Attach native archives to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # This job does not check out the repo, so tell gh which repo to use
+          # (otherwise it errors with "not a git repository").
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 || \
             gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes
