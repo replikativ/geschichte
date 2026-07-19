@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.replikativ</groupId>
+  <artifactId>geschichte</artifactId>
+  <version>template</version>
+  <packaging>jar</packaging>
+  <name>Geschichte</name>
+  <description>Queryable, Datahike-backed version control with Git compatibility.</description>
+  <url>https://github.com/replikativ/geschichte</url>
+  <licenses>
+    <license>
+      <name>Apache License 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+    </license>
+  </licenses>
+  <scm>
+    <connection>scm:git:git@github.com:replikativ/geschichte.git</connection>
+    <developerConnection>scm:git:git@github.com:replikativ/geschichte.git</developerConnection>
+    <url>https://github.com/replikativ/geschichte</url>
+  </scm>
+</project>

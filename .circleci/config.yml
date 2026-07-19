@@ -1,0 +1,89 @@
+version: 2.1
+
+orbs:
+  tools: replikativ/clj-tools@0
+
+commands:
+  prepare:
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-deps-{{ checksum "deps.edn" }}
+            - v1-deps-
+      - run:
+          name: Resolve dependencies
+          command: clojure -P -M:test:cljs-test:build
+      - save_cache:
+          key: v1-deps-{{ checksum "deps.edn" }}
+          paths:
+            - ~/.m2
+            - ~/.gitlibs
+
+jobs:
+  format:
+    executor: tools/clojurecli
+    steps:
+      - prepare
+      - run: clojure -M:format
+
+  jvm-test:
+    executor: tools/clojurecli
+    steps:
+      - prepare
+      - run: clojure -M:test
+
+  cljs-test:
+    executor: tools/clojurecli
+    steps:
+      - prepare
+      - run: clojure -M:cljs-test
+      - run: node target/node-test.js
+
+  jar:
+    executor: tools/clojurecli
+    steps:
+      - prepare
+      - run: clojure -T:build clean
+      - run: clojure -T:build jar
+      - persist_to_workspace:
+          root: .
+          paths: [target]
+
+  deploy:
+    executor: tools/clojurecli
+    steps:
+      - prepare
+      - attach_workspace: {at: .}
+      - run: clojure -T:build deploy
+
+  release:
+    executor: tools/clojurecli
+    steps:
+      - prepare
+      - attach_workspace: {at: .}
+      - run: clojure -T:build release
+
+workflows:
+  build-test-and-deploy:
+    jobs:
+      - format:
+          filters: {tags: {only: /.*/}}
+      - jvm-test:
+          filters: {tags: {only: /.*/}}
+      - cljs-test:
+          filters: {tags: {only: /.*/}}
+      - jar:
+          filters: {tags: {only: /.*/}}
+      - deploy:
+          context: clojars-deploy
+          filters:
+            branches: {ignore: /.*/}
+            tags: {only: /^v.*/}
+          requires: [format, jvm-test, cljs-test, jar]
+      - release:
+          context: github-token
+          filters:
+            branches: {ignore: /.*/}
+            tags: {only: /^v.*/}
+          requires: [deploy]

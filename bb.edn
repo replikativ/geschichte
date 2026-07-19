@@ -1,0 +1,15 @@
+{:min-bb-version "1.12.0"
+ :tasks
+ {test {:doc "Run the JVM test suite"
+        :task (clojure "-M:test")}
+  jar {:doc "Build the library jar"
+       :task (clojure "-T:build" "jar")}
+  cljs-test {:doc "Compile and run Node ClojureScript tests"
+             :task (do (clojure "-M:cljs-test")
+                       (shell "node" "target/node-test.js"))}
+  cli-smoke {:doc "Exercise the JVM CLI entrypoint"
+             :task (clojure "-M:cli" "--help")}
+  native-cli {:doc "Build the GraalVM native Geschichte executable"
+              :task (clojure "-T:build" "native")}
+  native-smoke {:doc "Exercise the native executable end to end"
+                :task (clojure "-T:build" "native-smoke")}}}

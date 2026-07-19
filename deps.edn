@@ -1,0 +1,74 @@
+{:paths ["src" "resources"]
+
+ :deps {org.clojure/clojure      {:mvn/version "1.12.4"}
+        org.replikativ/datahike  {:mvn/version "0.8.1743"}
+        ;; Pin the streaming hash API used by large-file ingestion. The CLJS
+        ;; compiler itself is supplied only by Geschichte's CLJS aliases.
+        org.replikativ/hasch     {:mvn/version "0.4.101"
+                                  :exclusions [org.clojure/clojurescript]}
+        ;; Geschichte uses Konserve's public blob API directly; native-only
+        ;; exclusions below retain the CLJS dependencies for browser and Node.
+        org.replikativ/konserve  {:mvn/version "0.9.362"}
+        is.simm/partial-cps      {:mvn/version "0.1.60"}
+        org.clojure/core.async   {:mvn/version "1.6.681"}
+        org.clojure/tools.cli    {:mvn/version "1.1.230"}}
+
+ :aliases
+ {:test {:extra-paths ["test"]
+         :extra-deps {io.github.cognitect-labs/test-runner
+                      {:git/sha "7284cda41fb9edc0f3bc6b6185cfb7138fc8a023"}
+                      ;; The adapter is optional at runtime, but its protocol
+                      ;; contract remains part of the complete test suite.
+                      org.replikativ/yggdrasil {:mvn/version "0.3.36"}}
+         :main-opts ["-m" "cognitect.test-runner"]}
+
+  :format {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
+           :main-opts ["-m" "cljfmt.main" "check" "src" "test"]}
+
+  :ffix {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
+         :main-opts ["-m" "cljfmt.main" "fix" "src" "test"]}
+
+  :build {:deps {io.github.clojure/tools.build {:mvn/version "0.9.6"}
+                  slipset/deps-deploy {:mvn/version "0.2.2"}
+                  io.github.borkdude/gh-release-artifact
+                  {:git/sha "b946558225a7839f6a0f644834e838e190dc2262"}}
+          :ns-default build}
+
+  :cljs-test {:extra-paths ["test"]
+              :extra-deps {org.clojure/clojurescript {:mvn/version "1.12.134"}
+                           thheller/shadow-cljs {:mvn/version "3.3.6"}}
+              :main-opts ["-m" "shadow.cljs.devtools.cli" "compile" "node-test"]}
+
+  :cljs-bench {:extra-paths ["dev"]
+               :extra-deps {org.clojure/clojurescript {:mvn/version "1.12.134"}
+                            thheller/shadow-cljs {:mvn/version "3.3.6"}}
+               :main-opts ["-m" "shadow.cljs.devtools.cli" "compile" "node-bench"]}
+
+  :bench {:extra-paths ["dev"]
+          :main-opts ["-m" "geschichte.bench-diff"]}
+
+  ;; Optional protocol adapter; Geschichte itself does not force Yggdrasil on
+  ;; Clojure users who only want the repository/filesystem API.
+  :yggdrasil {:extra-deps {org.replikativ/yggdrasil {:mvn/version "0.3.36"}}}
+
+  :local-yggdrasil
+  {:extra-deps {org.replikativ/yggdrasil {:local/root "../yggdrasil"}}}
+
+  :cli {:main-opts ["-m" "geschichte.cli"]}
+
+  :native-runtime
+  {:override-deps
+   {org.replikativ/datahike {:mvn/version "0.8.1743"
+                             :exclusions [com.github.pkpkpk/cljs-cache]}
+    org.replikativ/konserve {:mvn/version "0.9.362"
+                             :exclusions [org.clojure/clojurescript
+                                          com.github.pkpkpk/cljs-node-io
+                                          com.github.pkpkpk/fress
+                                          org.clojars.mmb90/cljs-cache]}}}
+
+  :native-compile
+  {:extra-paths ["build"]
+   :jvm-opts ["-Dclojure.compiler.direct-linking=true"]
+   :extra-deps
+   {org.clojure/tools.namespace {:mvn/version "1.5.0"}}
+   :main-opts ["-m" "geschichte.native"]}}}

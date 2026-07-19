@@ -1,0 +1,18 @@
+{:deps {:aliases [:cljs-test]}
+ :src-paths ["src" "test" "dev"]
+ :builds
+ {:node-test
+  {:target :node-script
+   :output-to "target/node-test.js"
+   :main geschichte.node-test/-main
+   :compiler-options
+   {:optimizations :advanced
+    :infer-externs :auto
+    :elide-asserts false}}
+  :node-bench
+  {:target :node-script
+   :output-to "target/node-bench.js"
+   :main geschichte.node-bench/-main
+   :compiler-options
+   {:optimizations :advanced
+    :infer-externs :auto}}}}

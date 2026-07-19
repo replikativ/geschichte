@@ -1,0 +1,10 @@
+/.cpcache/
+/.clj-kondo/
+/target/
+/out/
+/.shadow-cljs/
+/.internal/
+/classes/
+/gsch
+/geschichte
+node_modules/

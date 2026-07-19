@@ -1,0 +1,66 @@
+name: Native CLI
+
+on:
+  pull_request:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  native-cli:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            artifact: geschichte-linux-amd64
+          - os: macos-14
+            artifact: geschichte-macos-arm64
+          - os: macos-15-intel
+            artifact: geschichte-macos-amd64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: '25'
+          distribution: graalvm-community
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: 1.12.2.1565
+      - name: JVM tests
+        if: matrix.os == 'ubuntu-24.04'
+        run: clojure -M:test
+      - name: Build native executable
+        run: clojure -T:build native
+      - name: Native smoke test
+        run: clojure -T:build native-smoke
+      - name: Package native executable
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -czf "dist/${{ matrix.artifact }}.tar.gz" ges README.md
+          shasum -a 256 "dist/${{ matrix.artifact }}.tar.gz" > "dist/${{ matrix.artifact }}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: native-cli
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Attach native archives to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 || \
+            gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes
+          gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
