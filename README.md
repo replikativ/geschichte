@@ -1,8 +1,9 @@
 # geschichte
 
+[![Slack](https://img.shields.io/badge/slack-join_chat-brightgreen.svg)](https://clojurians.slack.com/archives/CB7GJAN0L)
 [![Clojars](https://img.shields.io/clojars/v/org.replikativ/geschichte.svg)](https://clojars.org/org.replikativ/geschichte)
 [![CircleCI](https://circleci.com/gh/replikativ/geschichte.svg?style=shield)](https://circleci.com/gh/replikativ/geschichte)
-[![Slack](https://img.shields.io/badge/slack-join_chat-brightgreen.svg)](https://clojurians.slack.com/archives/C09622F337D)
+[![last-commit](https://img.shields.io/github/last-commit/replikativ/geschichte/main.svg)](https://github.com/replikativ/geschichte)
 
 **Git, as a queryable database.**
 
@@ -19,6 +20,10 @@ combination no other system provides — see [Prior art](doc/prior-art.md).
 
 It is a new implementation in the lineage of the original *geschichte* project,
 which became replikativ.
+
+> **Beta.** geschichte is usable but pre-1.0. On-disk and database formats may
+> still change between releases; you may need to re-import or migrate
+> repositories as it stabilises.
 
 ## Why geschichte?
 
@@ -93,13 +98,16 @@ See [Getting started](doc/getting-started.md) and the
 geschichte-specific inspection under its own namespaces:
 
 ```sh
-clojure -M:cli -- init
-clojure -M:cli -- status --short
-clojure -M:cli -- add -A
-clojure -M:cli -- commit -m initial
-clojure -M:cli -- log --oneline
-clojure -M:cli -- db query '[:find ?path :where [?e :geschichte.work/path ?path]]'
+ges init
+ges status --short
+ges add -A
+ges commit -m initial
+ges log --oneline
+ges db query '[:find ?path :where [?e :geschichte.work/path ?path]]'
 ```
+
+From a source checkout, replace `ges` with `clojure -M:cli --`
+(e.g. `clojure -M:cli -- status --short`).
 
 Tagged releases ship native `ges` archives for Linux amd64, macOS arm64, and
 macOS amd64. See the [CLI guide](doc/cli.md).

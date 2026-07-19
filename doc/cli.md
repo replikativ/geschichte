@@ -3,10 +3,12 @@
 The JVM entrypoint is `geschichte.cli`; native releases package it as `ges`.
 
 ```sh
-clojure -M:cli -- --help
-clojure -M:cli -- status --help
+ges --help
 ges status --help
 ```
+
+From a source checkout, run the same commands as `clojure -M:cli -- …`
+(e.g. `clojure -M:cli -- status --help`).
 
 Git-compatible commands are top-level. `ges git …` remains an alias for tools
 that insist on a Git-shaped wrapper. Per-command help validates the same option
