@@ -68,6 +68,13 @@
    ;; persistent-set nodes per cache layer.
    :store-cache-size 256
    :search-cache-size 0
+   ;; Value-size caps are OPT-IN in Datahike; leaving them unset warns at
+   ;; create. Geschichte stores arbitrary Git content (blobs of any size), so it
+   ;; deliberately disables the caps (0 = unbounded) — content is sized by
+   ;; content-defined chunking and deltas, not by a per-value length limit.
+   :max-string-length 0
+   :max-bytes-length 0
+   :max-tuple-string-length 0
    :schema-flexibility :write
    :keep-history? true
    :commit-graph? true})
