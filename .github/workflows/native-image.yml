@@ -11,6 +11,7 @@ permissions:
 jobs:
   native-cli:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-24.04

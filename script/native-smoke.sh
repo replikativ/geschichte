@@ -2,10 +2,14 @@
 set -euo pipefail
 
 ges="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
-workspace="$(mktemp -d "${TMPDIR:-/tmp}/geschichte-native-XXXXXX")"
-agent="$(mktemp -d "${TMPDIR:-/tmp}/geschichte-agent-XXXXXX")"
-native_source="$(mktemp -d "${TMPDIR:-/tmp}/geschichte-git-source-XXXXXX")"
-local_clone="$(mktemp -d "${TMPDIR:-/tmp}/geschichte-local-clone-XXXXXX")"
+# Canonicalise temp dirs: on macOS $TMPDIR (/var/folders/…) is a symlink to
+# /private/var/…, and `rev-parse --show-toplevel` returns the resolved path, so
+# a raw mktemp path would not compare equal. `pwd -P` resolves the symlink.
+mktmp() { cd "$(mktemp -d "${TMPDIR:-/tmp}/$1-XXXXXX")" && pwd -P; }
+workspace="$(mktmp geschichte-native)"
+agent="$(mktmp geschichte-agent)"
+native_source="$(mktmp geschichte-git-source)"
+local_clone="$(mktmp geschichte-local-clone)"
 trap 'rm -rf "$workspace" "$agent" "$native_source" "$local_clone"' EXIT
 
 cd "$workspace"

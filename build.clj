@@ -85,7 +85,14 @@
     (println output)))
 
 (defn native-smoke [{:keys [executable] :or {executable "./ges"}}]
-  (let [result (b/process {:command-args ["bash" "script/native-smoke.sh"
-                                          executable]})]
+  ;; `-x` traces every command so a failing assertion is visible in the log
+  ;; (a bare `test` prints nothing on failure); capture + echo so the trace is
+  ;; always shown, including in CI.
+  (let [result (b/process {:command-args ["bash" "-x" "script/native-smoke.sh"
+                                          executable]
+                           :out :capture :err :capture})]
+    (some-> (:out result) print)
+    (some-> (:err result) print)
+    (flush)
     (when-not (zero? (:exit result))
-      (throw (ex-info "Native smoke test failed" result)))))
+      (throw (ex-info "Native smoke test failed" {:exit (:exit result)})))))
