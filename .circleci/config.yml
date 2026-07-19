@@ -67,23 +67,19 @@ jobs:
 workflows:
   build-test-and-deploy:
     jobs:
-      - format:
-          filters: {tags: {only: /.*/}}
-      - jvm-test:
-          filters: {tags: {only: /.*/}}
-      - cljs-test:
-          filters: {tags: {only: /.*/}}
-      - jar:
-          filters: {tags: {only: /.*/}}
+      - format
+      - jvm-test
+      - cljs-test
+      - jar
       - deploy:
           context: clojars-deploy
           filters:
-            branches: {ignore: /.*/}
-            tags: {only: /^v.*/}
+            branches:
+              only: main
           requires: [format, jvm-test, cljs-test, jar]
       - release:
           context: github-token
           filters:
-            branches: {ignore: /.*/}
-            tags: {only: /^v.*/}
+            branches:
+              only: main
           requires: [deploy]
