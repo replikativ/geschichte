@@ -11,7 +11,9 @@
         org.replikativ/konserve  {:mvn/version "0.9.362"}
         is.simm/partial-cps      {:mvn/version "0.1.60"}
         org.clojure/core.async   {:mvn/version "1.6.681"}
-        org.clojure/tools.cli    {:mvn/version "1.1.230"}}
+        org.clojure/tools.cli    {:mvn/version "1.1.230"}
+        ;; geschichte.code splits Clojure source into top-level forms
+        org.clojure/tools.reader {:mvn/version "1.5.2"}}
 
  :aliases
  {:test {:extra-paths ["test"]
@@ -55,6 +57,23 @@
   {:extra-deps {org.replikativ/yggdrasil {:local/root "../yggdrasil"}}}
 
   :cli {:main-opts ["-m" "geschichte.cli"]}
+
+  ;; Semantic code search (geschichte.code.embed): embeddings → Proximum KNN as
+  ;; a Datalog clause. Needs a Datahike with :db.type/float-array + the
+  ;; external-engine query-spec-fn (≥ 0.8.1746) and Java 22+ (Proximum's HNSW).
+  ;; The bridge ns datahike.index.secondary.proximum ships in the datahike jar.
+  ;; Bring your own embedder (any (fn [texts] -> [float[]])).
+  :embed {:override-deps {org.replikativ/datahike {:mvn/version "0.8.1746"}
+                          ;; float-array content-addressing (:db.secondary/only)
+                          ;; needs hasch's float[]/double[] coercion (≥ 0.4.102);
+                          ;; geschichte's core pin is older.
+                          org.replikativ/hasch {:mvn/version "0.4.102"}}
+          :extra-deps {org.replikativ/proximum {:mvn/version "0.1.25"}}
+          :jvm-opts ["--add-modules" "jdk.incubator.vector"
+                     "--enable-native-access=ALL-UNNAMED"]}
+
+  ;; Deep structural (syntactic) queries (geschichte.code.ast) via tools.analyzer.
+  :ast {:extra-deps {org.clojure/tools.analyzer.jvm {:mvn/version "1.3.2"}}}
 
   :native-runtime
   {:override-deps
