@@ -202,6 +202,61 @@
                                 :time (:time opts)}))
      this))
 
+  p/GarbageCollectable
+  (gc-roots [_]
+    ;; Every ref tip, as the snapshot it names. These are the git refs whose
+    ;; commits must survive collection.
+    ;; `repo/refs` is {logical-ref -> commit-id-or-nil}; a ref with no target
+    ;; (a freshly created branch) contributes nothing.
+    (->> (repo/refs conn)
+         vals
+         (remove nil?)
+         (keep (fn [cid] (:geschichte.commit/snapshot (repo/commit-by-id conn cid))))
+         (map str)
+         set))
+
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
+  (gc-sweep! [_ _snapshot-ids opts]
+    ;; Reclaim orphaned Datahike index blobs. Datahike computes its own
+    ;; reachability, so the coordinator's snapshot-ids are ignored — same
+    ;; contract as the datahike adapter.
+    ;;
+    ;; A NON-EPOCH `:remove-before` IS REFUSED, and that is the whole point of
+    ;; this method existing rather than letting the generic adapter run.
+    ;; `:geschichte.commit/snapshot` resolves through `d/commit-as-db`, so a
+    ;; Datahike commit record IS a Git tree — and Datahike follows ancestry only
+    ;; while a record is newer than the cutoff, because its own liveness rule is
+    ;; reachability AND recency. Geschichte's refs are ordinary datoms, invisible
+    ;; to that rule, so every commit looks like unreferenced old history.
+    ;;
+    ;; Measured: three commits plus a non-epoch cutoff reclaimed 75 keys, after
+    ;; which `repo/tree`, `repo/status` and `repo/tree-at` all throw "Geschichte
+    ;; commit names a missing Datahike checkpoint" while `repo/read` still works
+    ;; — a silently half-destroyed repository. Refusing is strictly better than
+    ;; reclaiming and bricking.
+    ;;
+    ;; Epoch (the default) is safe and reclaims writes published to Konserve
+    ;; that no transaction ever made reachable: interrupted pack imports, killed
+    ;; agents, aborted large writes.
+    (let [opts (t/async-gc-opts "geschichte/gc-sweep!" opts)
+          rb   (:remove-before opts)
+          epoch (#?(:clj java.util.Date. :cljs js/Date.) 0)]
+      (when (and rb (pos? (inst-ms rb)))
+        (throw (ex-info (str "Refusing a non-epoch :remove-before on a Geschichte repository. "
+                             "Geschichte's refs are datoms, so Datahike cannot see them as "
+                             "roots; a cutoff would delete the commit snapshots the refs name "
+                             "and silently brick the repository.")
+                        {:type :geschichte/unsafe-gc-cutoff
+                         :remove-before rb
+                         :system system-name})))
+      (platform-async
+       (if (:dry-run? opts)
+         {:system-id system-name :dry-run? true}
+         (let [removed (await (execution/io-result (d/gc-storage conn epoch)
+                                                   execution/default-opts))]
+           {:system-id system-name
+            :reclaimed (if (counted? removed) (count removed) 0)})))))
+
   p/Overlayable
   (overlay [this _opts]
     (platform-async
