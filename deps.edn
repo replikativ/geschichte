@@ -18,10 +18,7 @@
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
-                      {:git/sha "7284cda41fb9edc0f3bc6b6185cfb7138fc8a023"}
-                      ;; The adapter is optional at runtime, but its protocol
-                      ;; contract remains part of the complete test suite.
-                      org.replikativ/yggdrasil {:mvn/version "0.3.36"}}
+                      {:git/sha "7284cda41fb9edc0f3bc6b6185cfb7138fc8a023"}}
          :main-opts ["-m" "cognitect.test-runner"]}
 
   :format {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
@@ -48,13 +45,6 @@
 
   :bench {:extra-paths ["dev"]
           :main-opts ["-m" "geschichte.bench-diff"]}
-
-  ;; Optional protocol adapter; Geschichte itself does not force Yggdrasil on
-  ;; Clojure users who only want the repository/filesystem API.
-  :yggdrasil {:extra-deps {org.replikativ/yggdrasil {:mvn/version "0.3.36"}}}
-
-  :local-yggdrasil
-  {:extra-deps {org.replikativ/yggdrasil {:local/root "../yggdrasil"}}}
 
   :cli {:main-opts ["-m" "geschichte.cli"]}
 
