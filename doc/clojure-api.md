@@ -11,7 +11,6 @@ Geschichte deliberately exposes small namespaces rather than one generated API.
 | `geschichte.git.local` | native `.git` discovery and object/ref import |
 | `geschichte.git.http` | injectable smart-HTTP clone/fetch/push/pull |
 | `geschichte.git.transport` | JVM HTTP/SSH transport selection |
-| `geschichte.yggdrasil` | optional Yggdrasil adapter |
 
 ## Filesystem API
 
