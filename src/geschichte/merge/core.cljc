@@ -45,16 +45,49 @@
   (merge-base-from-distances (ancestor-distances parents-of ours)
                              (ancestor-distances parents-of theirs)))
 
-(defn- resolve-path [path base ours theirs]
+(defn- resolve-path
+  "Resolve one path from its three tree entries.
+
+  The first three cases are decidable from the entries alone. The fourth — both
+  sides changed it — is where git does one more thing: it merges the two blobs
+  line by line and only conflicts if THAT fails. `resolve-content` is that step,
+  supplied by a caller that can read content (see `geschichte.repo/content-merger`);
+  it takes the three entries and returns a replacement entry, or nil when it
+  cannot merge them.
+
+  Without it the fourth case is a conflict, which is what this did before and
+  what it still does when no resolver is given. That is correct and coarse: two
+  people editing different parts of one file collide on every merge."
+  [path base ours theirs resolve-content]
   (cond
     (= ours theirs) {:path path :value ours}
     (= ours base) {:path path :value theirs}
     (= theirs base) {:path path :value ours}
-    :else {:path path :conflict {:base base :ours ours :theirs theirs}}))
+    :else
+    (if-let [merged (when (and resolve-content
+                               ;; a side that does not EXIST has no content to
+                               ;; merge — add/add and add/delete are structural
+                               ;; disagreements, not textual ones
+                               (not-any? #(= absent %) [base ours theirs]))
+                      (resolve-content path base ours theirs))]
+      {:path path :value merged :merged? true}
+      {:path path :conflict {:base base :ours ours :theirs theirs}})))
 
 (defn plan-trees
-  "Plan a merge from already-resolved commit IDs and immutable path maps."
-  [base-id ours-id theirs-id base-tree ours-tree theirs-tree]
+  "Plan a merge from already-resolved commit IDs and immutable path maps.
+
+  `opts` may carry `:resolve-content`, a fn `(path base ours theirs)` over tree
+  ENTRIES returning a merged entry or nil — the content-level merge git performs
+  before declaring a path conflicted. Omit it and every path both sides touched
+  conflicts, which is the historical behaviour.
+
+  This namespace stays pure: the resolver is passed in because merging content
+  means READING it, and reading needs a connection. `geschichte.repo/content-merger`
+  builds one."
+  ([base-id ours-id theirs-id base-tree ours-tree theirs-tree]
+   (plan-trees base-id ours-id theirs-id base-tree ours-tree theirs-tree nil))
+  ([base-id ours-id theirs-id base-tree ours-tree theirs-tree
+    {:keys [resolve-content]}]
   (let [paths (sort (set/union (set (keys base-tree))
                                (set (keys ours-tree))
                                (set (keys theirs-tree))))
@@ -63,7 +96,8 @@
                 (resolve-path path
                               (get base-tree path absent)
                               (get ours-tree path absent)
-                              (get theirs-tree path absent)))
+                              (get theirs-tree path absent)
+                              resolve-content))
               paths)
         conflicts (into (sorted-map)
                         (keep (fn [{:keys [path conflict]}]
@@ -78,4 +112,10 @@
                  (= base-id ours-id) :fast-forward
                  :else :merge)
      :base base-id :ours ours-id :theirs theirs-id
-     :tree tree :conflicts conflicts :clean? (empty? conflicts)}))
+     :tree tree :conflicts conflicts :clean? (empty? conflicts)
+     ;; the paths a content merge settled — a caller writing a merge commit
+     ;; message, or a reviewer, wants to know which files were reconciled
+     ;; rather than taken wholesale from one side
+     :merged (into (sorted-set) (keep (fn [{:keys [path merged?]}]
+                                        (when merged? path))
+                                      resolutions))})))
