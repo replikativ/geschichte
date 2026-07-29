@@ -88,34 +88,34 @@
    (plan-trees base-id ours-id theirs-id base-tree ours-tree theirs-tree nil))
   ([base-id ours-id theirs-id base-tree ours-tree theirs-tree
     {:keys [resolve-content]}]
-  (let [paths (sort (set/union (set (keys base-tree))
-                               (set (keys ours-tree))
-                               (set (keys theirs-tree))))
-        resolutions
-        (mapv (fn [path]
-                (resolve-path path
-                              (get base-tree path absent)
-                              (get ours-tree path absent)
-                              (get theirs-tree path absent)
-                              resolve-content))
-              paths)
-        conflicts (into (sorted-map)
-                        (keep (fn [{:keys [path conflict]}]
-                                (when conflict [path conflict])))
-                        resolutions)
-        tree (into (sorted-map)
-                   (keep (fn [{:keys [path value conflict]}]
-                           (when (and (nil? conflict) (not= value absent))
-                             [path value])))
-                   resolutions)]
-    {:kind (cond (= ours-id theirs-id) :up-to-date
-                 (= base-id ours-id) :fast-forward
-                 :else :merge)
-     :base base-id :ours ours-id :theirs theirs-id
-     :tree tree :conflicts conflicts :clean? (empty? conflicts)
+   (let [paths (sort (set/union (set (keys base-tree))
+                                (set (keys ours-tree))
+                                (set (keys theirs-tree))))
+         resolutions
+         (mapv (fn [path]
+                 (resolve-path path
+                               (get base-tree path absent)
+                               (get ours-tree path absent)
+                               (get theirs-tree path absent)
+                               resolve-content))
+               paths)
+         conflicts (into (sorted-map)
+                         (keep (fn [{:keys [path conflict]}]
+                                 (when conflict [path conflict])))
+                         resolutions)
+         tree (into (sorted-map)
+                    (keep (fn [{:keys [path value conflict]}]
+                            (when (and (nil? conflict) (not= value absent))
+                              [path value])))
+                    resolutions)]
+     {:kind (cond (= ours-id theirs-id) :up-to-date
+                  (= base-id ours-id) :fast-forward
+                  :else :merge)
+      :base base-id :ours ours-id :theirs theirs-id
+      :tree tree :conflicts conflicts :clean? (empty? conflicts)
      ;; the paths a content merge settled — a caller writing a merge commit
      ;; message, or a reviewer, wants to know which files were reconciled
      ;; rather than taken wholesale from one side
-     :merged (into (sorted-set) (keep (fn [{:keys [path merged?]}]
-                                        (when merged? path))
-                                      resolutions))})))
+      :merged (into (sorted-set) (keep (fn [{:keys [path merged?]}]
+                                         (when merged? path))
+                                       resolutions))})))
