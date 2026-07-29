@@ -856,5 +856,11 @@
                        ;; to transact, the tree entry below IS the reference
                        id (content/transact-content! conn value nil (constantly []))]
                    {:content id
-                    :size (bytes/length value)
+                    ;; LONG, explicitly. `:geschichte.work/size` is
+                    ;; `:db.type/long` and datahike checks the class, so an
+                    ;; Integer here transacts fine into a plan and then throws
+                    ;; the moment that plan is APPLIED — which is why the
+                    ;; planning tests did not catch it and the adapter's
+                    ;; merge test did.
+                    :size (long (bytes/length value))
                     :mode (:mode ours)}))))))))))
