@@ -46,15 +46,23 @@
   Tree values are stable logical content/mode metadata, so physical full-vs-delta
   choices cannot create conflicts. Returns a resolved `:tree` plus structural
   conflicts containing base/ours/theirs values (or `::absent` for deletion)."
-  [conn ours theirs]
-  (let [base (merge-base conn ours theirs)]
-    (when-not base
-      (throw (ex-info "Commits have no common ancestor"
-                      {:ours ours :theirs theirs})))
-    (core/plan-trees base ours theirs
-                     (repo/tree-at conn base)
-                     (repo/tree-at conn ours)
-                     (repo/tree-at conn theirs))))
+  ([conn ours theirs] (plan conn ours theirs nil))
+  ([conn ours theirs {:keys [merge-content?] :or {merge-content? true}}]
+   (let [base (merge-base conn ours theirs)]
+     (when-not base
+       (throw (ex-info "Commits have no common ancestor"
+                       {:ours ours :theirs theirs})))
+     ;; Content merging on by default: a path both sides edited in different
+     ;; places is not a conflict anyone wants reported, and leaving it off by
+     ;; default would mean every existing caller keeps arbitrating merges that
+     ;; resolve themselves. `:merge-content? false` restores the structural-only
+     ;; plan for callers that want to see raw tree divergence.
+     (core/plan-trees base ours theirs
+                      (repo/tree-at conn base)
+                      (repo/tree-at conn ours)
+                      (repo/tree-at conn theirs)
+                      (when merge-content?
+                        {:resolve-content (repo/content-merger conn)})))))
 
 (defn prepare!
   "Plan and stage a clean merge. Conflicting plans are returned unchanged and do

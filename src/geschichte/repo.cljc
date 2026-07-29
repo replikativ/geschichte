@@ -11,6 +11,7 @@
             [geschichte.async :as execution]
             [geschichte.bytes :as bytes]
             [geschichte.content :as content]
+            [geschichte.merge.text :as text]
             [geschichte.query :as query]
             [geschichte.schema :as schema]
             [is.simm.partial-cps.async :refer [await]]
@@ -809,3 +810,51 @@
      (d/branch! conn (d/commit-id @conn) branch-keyword)
      execution/default-opts))
    branch-keyword))
+
+;; ---------------------------------------------------------------------------
+;; Content-level merge — the resolver `merge.core/plan-trees` takes
+;; ---------------------------------------------------------------------------
+
+(defn content-merger
+  "A `:resolve-content` fn for `merge.core/plan-trees`, bound to `conn`.
+
+  `plan-trees` decides a path from its tree entries and cannot do better on its
+  own: it holds content IDs, and merging content means reading it. This supplies
+  that half — read the three blobs, merge them line by line, store the result,
+  and hand back a tree entry pointing at it. Returns nil when the merge does not
+  settle, and the path conflicts exactly as before.
+
+  Declines rather than guesses in three cases, each of which would otherwise
+  produce a plausible-looking wrong answer: a side whose bytes are not valid
+  UTF-8 or contain a NUL (binary — line merging is meaningless), a side over
+  `max-bytes` (a merge is not the place to load an arbitrarily large blob), and
+  any entry whose `:mode` differs across the sides (a file that became a symlink
+  is not a text change).
+
+  JVM-shaped: it reads and writes synchronously, which is why it lives here
+  rather than in the portable planner."
+  ([conn] (content-merger conn nil))
+  ([conn {:keys [max-bytes] :or {max-bytes (* 1 1024 1024)}}]
+   (fn [_path base ours theirs]
+     (let [entries [base ours theirs]]
+       (when (and (apply = (map :mode entries))
+                  (every? #(<= (or (:size %) 0) max-bytes) entries))
+         (let [texts (mapv (fn [{:keys [content]}]
+                             (try
+                               (let [bs (content/read-by-id conn content)
+                                     s (when bs (bytes/decode-utf8 bs))]
+                                 (when (and s (not (str/includes? s "\u0000")))
+                                   s))
+                               (catch #?(:clj Exception :cljs :default) _ nil)))
+                           entries)]
+           (when (every? some? texts)
+             (let [[b o t] texts
+                   {:keys [clean? text]} (text/merge-text b o t)]
+               (when clean?
+                 (let [value (bytes/utf8 text)
+                       ;; store the merged bytes and take their id; no metadata
+                       ;; to transact, the tree entry below IS the reference
+                       id (content/transact-content! conn value nil (constantly []))]
+                   {:content id
+                    :size (bytes/length value)
+                    :mode (:mode ours)}))))))))))
