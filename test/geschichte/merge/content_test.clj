@@ -159,3 +159,25 @@
     (is (not (:clean? p))
         "the six-arity plan is unchanged, so nothing that does not ask for
          content merging can be surprised by it")))
+
+(deftest a-merged-plan-can-actually-be-applied
+  ;; The planning tests above stop at the plan, and a plan is not a merge. This
+  ;; one commits it — which is where a tree entry with a wrong value TYPE
+  ;; surfaces, since datahike checks the class only on transact.
+  (let [[conn ours theirs] (two-sided (bytes/utf8 "one\ntwo\nthree\nfour\n")
+                                      (bytes/utf8 "ONE\ntwo\nthree\nfour\n")
+                                      (bytes/utf8 "one\ntwo\nthree\nFOUR\n"))]
+    (repo/checkout! conn "refs/heads/main")
+    (let [p (gmerge/plan conn ours theirs)]
+      (is (:clean? p))
+      (repo/prepare-merge! conn p)
+      (repo/commit! conn {:message "merge" :author "test"})
+      (is (= "ONE\ntwo\nthree\nFOUR\n" (String. (repo/read conn "f.txt")))
+          "both edits, materialized in the worktree")
+      ;; re-resolve the tip: `head-commit` pulls the REF TARGET, and that pull
+      ;; pattern carries no `:geschichte.commit/parents` — reading parents off
+      ;; it answers 0 for every commit
+      (is (= 2 (count (:geschichte.commit/parents
+                       (repo/commit-by-id conn (:geschichte.commit/id
+                                                (repo/head-commit conn))))))
+          "and it is a real two-parent merge commit"))))
