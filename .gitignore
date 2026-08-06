@@ -5,6 +5,5 @@
 /.shadow-cljs/
 /.internal/
 /classes/
-/gsch
-/geschichte
+/ges
 node_modules/

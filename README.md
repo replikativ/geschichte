@@ -7,6 +7,10 @@
 
 **Git, as a queryable database.**
 
+*Geschichte* is German for both **history** and **story** — which is what a
+repository is. Say it **ges** (hard *g*, rhymes with *yes*); that is also the
+name of the CLI.
+
 geschichte is version control whose objects, refs, worktree, and history live in
 [Datahike](https://github.com/replikativ/datahike) and
 [Konserve](https://github.com/replikativ/konserve) — so you can commit, branch,
