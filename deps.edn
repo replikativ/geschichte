@@ -1,14 +1,16 @@
 {:paths ["src" "resources"]
 
- :deps {org.clojure/clojure      {:mvn/version "1.12.4"}
-        org.replikativ/datahike  {:mvn/version "0.8.1743"}
+ :deps {org.clojure/clojure      {:mvn/version "1.12.5"}
+        org.replikativ/datahike  {:mvn/version "0.8.1865"}
         ;; Pin the streaming hash API used by large-file ingestion. The CLJS
         ;; compiler itself is supplied only by Geschichte's CLJS aliases.
-        org.replikativ/hasch     {:mvn/version "0.4.101"
+        ;; Keep at or above what the Datahike pin above requires: top-level
+        ;; deps win in tools.deps, so an older direct pin silently downgrades it.
+        org.replikativ/hasch     {:mvn/version "0.4.104"
                                   :exclusions [org.clojure/clojurescript]}
         ;; Geschichte uses Konserve's public blob API directly; native-only
         ;; exclusions below retain the CLJS dependencies for browser and Node.
-        org.replikativ/konserve  {:mvn/version "0.9.362"}
+        org.replikativ/konserve  {:mvn/version "0.9.391"}
         is.simm/partial-cps      {:mvn/version "0.1.60"}
         org.clojure/core.async   {:mvn/version "1.6.681"}
         org.clojure/tools.cli    {:mvn/version "1.1.230"}
@@ -50,15 +52,13 @@
 
   ;; Semantic code search (geschichte.code.embed): embeddings → Proximum KNN as
   ;; a Datalog clause. Needs a Datahike with :db.type/float-array + the
-  ;; external-engine query-spec-fn (≥ 0.8.1746) and Java 22+ (Proximum's HNSW).
+  ;; external-engine query-spec-fn (≥ 0.8.1746), hasch's float[]/double[]
+  ;; coercion for :db.secondary/only content-addressing (≥ 0.4.102), and Java
+  ;; 22+ (Proximum's HNSW). The first two are met by the core pins above, so
+  ;; this alias does not override Geschichte's storage substrate.
   ;; The bridge ns datahike.index.secondary.proximum ships in the datahike jar.
   ;; Bring your own embedder (any (fn [texts] -> [float[]])).
-  :embed {:override-deps {org.replikativ/datahike {:mvn/version "0.8.1746"}
-                          ;; float-array content-addressing (:db.secondary/only)
-                          ;; needs hasch's float[]/double[] coercion (≥ 0.4.102);
-                          ;; geschichte's core pin is older.
-                          org.replikativ/hasch {:mvn/version "0.4.102"}}
-          :extra-deps {org.replikativ/proximum {:mvn/version "0.1.25"}}
+  :embed {:extra-deps {org.replikativ/proximum {:mvn/version "0.1.25"}}
           :jvm-opts ["--add-modules" "jdk.incubator.vector"
                      "--enable-native-access=ALL-UNNAMED"]}
 
@@ -67,9 +67,9 @@
 
   :native-runtime
   {:override-deps
-   {org.replikativ/datahike {:mvn/version "0.8.1743"
+   {org.replikativ/datahike {:mvn/version "0.8.1865"
                              :exclusions [com.github.pkpkpk/cljs-cache]}
-    org.replikativ/konserve {:mvn/version "0.9.362"
+    org.replikativ/konserve {:mvn/version "0.9.391"
                              :exclusions [org.clojure/clojurescript
                                           com.github.pkpkpk/cljs-node-io
                                           com.github.pkpkpk/fress
