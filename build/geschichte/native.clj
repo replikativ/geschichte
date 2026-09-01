@@ -11,12 +11,18 @@
         (io/delete-file file true)))
     (.mkdirs directory)))
 
+(def ^:private optional-namespaces
+  "Integrations that are not part of the standalone native CLI and require
+   dependencies supplied by their own aliases."
+  #{'geschichte.code.embed
+    'geschichte.yggdrasil})
+
 (defn -main [& _]
   (clean-directory! "classes")
   (binding [*compile-path* "classes"]
     (doseq [namespace (->> (find-namespaces-in-dir (io/file "src"))
                            distinct
-                           (remove #{'geschichte.yggdrasil}))]
+                           (remove optional-namespaces))]
       (println "Compiling" namespace)
       (compile namespace)))
   (shutdown-agents))
