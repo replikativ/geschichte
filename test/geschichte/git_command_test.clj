@@ -369,3 +369,54 @@
         (is (= "feature\n" (String. ^bytes (repo/read conn "feature.txt")
                                     "UTF-8"))))
       (finally (cleanup f)))))
+
+(deftest log-and-show-expand-commit-format-placeholders
+  (let [{:keys [conn] :as f} (fixture)
+        config (atom {})
+        run (fn [argv]
+              (command/execute
+               {:conn conn :root "/project" :config config
+                :repo-relative (fn [path] (if (= "." path) "" path))}
+               argv))
+        out (fn [argv] (str/trim-newline (:stdout (run argv))))]
+    (try
+      (repo/init! conn)
+      (run ["config" "user.name" "Ada"])
+      (run ["config" "user.email" "ada@example.test"])
+      (repo/write! conn "README.md" (.getBytes "hello\n" "UTF-8"))
+      (run ["add" "."])
+      ;; a subject with a pipe and a percent code, plus a body
+      (run ["commit" "-m" "feat: a|b and %an\n\nbody line one\nbody line two"])
+      (is (= "feat: a|b and %an" (out ["log" "-1" "--format=%s"]))
+          "%s is the subject line, and expanded text is not rescanned")
+      (is (= "body line one\nbody line two" (out ["log" "-1" "--format=%b"])))
+      (is (= "feat: a|b and %an\n\nbody line one\nbody line two"
+             (out ["log" "-1" "--format=%B"])))
+      (is (= "Ada|ada@example.test" (out ["log" "-1" "--format=%an|%ae"])))
+      (is (= "Ada|ada@example.test" (out ["log" "-1" "--format=%cn|%cE"]))
+          "committer spellings render the recorded author")
+      (is (= "%" (out ["log" "-1" "--format=%%"])))
+      (is (= "a\nb" (out ["log" "-1" "--format=a%nb"])))
+      (let [id (out ["log" "-1" "--format=%H"])
+            short (out ["log" "-1" "--format=%h"])]
+        (is (= 8 (count short)))
+        (is (str/starts-with? id short))
+        (is (= (str id " " short) (out ["log" "-1" "--format=%H %h"]))))
+      (is (re-matches #"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}"
+                      (out ["log" "-1" "--format=%ai"]))
+          "%ai renders the commit time, not the literal code")
+      (is (re-matches #"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z"
+                      (out ["log" "-1" "--format=%aI"])))
+      (is (re-matches #"\w{3} \w{3} \d{1,2} \d{2}:\d{2}:\d{2} \d{4} [+-]\d{4}"
+                      (out ["log" "-1" "--format=%ad"])))
+      (is (re-matches #"\d{10,}" (out ["log" "-1" "--format=%at"])))
+      (is (= "" (out ["log" "-1" "--format=%P"])) "the root commit has no parent")
+      (is (str/starts-with? (out ["show" "--format=%s" "--stat"]) "feat: a|b and %an")
+          "show expands the same placeholders, then its diffstat")
+      (repo/write! conn "README.md" (.getBytes "again\n" "UTF-8"))
+      (run ["add" "."])
+      (run ["commit" "-m" "second"])
+      (let [parent (out ["log" "-1" "--format=%H" "HEAD~1"])]
+        (is (= parent (out ["log" "-1" "--format=%P"])))
+        (is (= (subs parent 0 8) (out ["log" "-1" "--format=%p"]))))
+      (finally (cleanup f)))))

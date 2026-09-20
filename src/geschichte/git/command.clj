@@ -24,6 +24,69 @@
            [java.nio.charset CharacterCodingException CodingErrorAction
             StandardCharsets]))
 
+(def ^:private git-date-format
+  (java.time.format.DateTimeFormatter/ofPattern "EEE MMM d HH:mm:ss yyyy Z" java.util.Locale/ENGLISH))
+
+(def ^:private git-iso-like-format
+  (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd HH:mm:ss Z" java.util.Locale/ENGLISH))
+
+(defn- commit-time
+  "The commit's timestamp as a ZonedDateTime in UTC (Geschichte stores an
+   instant, without the author's offset)."
+  [commit]
+  (some-> (:geschichte.commit/time commit)
+          .toInstant
+          (.atZone java.time.ZoneOffset/UTC)))
+
+(defn- commit-date-string [commit code]
+  (if-let [t (commit-time commit)]
+    (case code
+      "d" (.format t git-date-format)
+      "i" (.format t git-iso-like-format)
+      "I" (.format t java.time.format.DateTimeFormatter/ISO_OFFSET_DATE_TIME)
+      "t" (str (.toEpochSecond t)))
+    ""))
+
+(defn expand-commit-format
+  "Expand a Git `--format`/`--pretty` placeholder string for one commit.
+
+   Supported: `%H` `%h` (abbreviated), `%P` `%p` (parents), `%s` (subject:
+   the message's first line), `%b` (body), `%B` (raw message), `%an` `%ae`
+   (and the `%aN` `%aE` mailmap spellings), the author dates `%ad` `%ai`
+   `%aI` `%at`, the committer spellings `%cn` `%ce` `%cN` `%cE` `%cd` `%ci`
+   `%cI` `%ct` (Geschichte records one author and time per commit, so they
+   render the same values), `%n` and `%%`.
+
+   Expansion is a single pass, so text coming from the commit is never
+   rescanned for placeholders."
+  [fmt commit]
+  (let [id (str (:geschichte.commit/id commit))
+        message (str (:geschichte.commit/message commit))
+        [subject body] (let [i (str/index-of message "\n")]
+                         (if i
+                           [(subs message 0 i) (str/replace (subs message (inc i)) #"^\n+" "")]
+                           [message ""]))
+        author (str (:geschichte.commit/author commit))
+        [_ author-name author-email] (or (re-matches #"^(.*?) <(.*?)>$" author)
+                                         [nil author ""])
+        parents (->> (:geschichte.commit/parents commit)
+                     (map #(str (or (:geschichte.commit/id %) %))))]
+    (str/replace fmt #"%(%|n|H|h|P|p|s|b|B|a[nNeEdiIt]|c[nNeEdiIt])"
+                 (fn [[_ code]]
+                   (case code
+                     "%" "%"
+                     "n" "\n"
+                     "H" id
+                     "h" (subs id 0 (min 8 (count id)))
+                     "P" (str/join " " parents)
+                     "p" (str/join " " (map #(subs % 0 (min 8 (count %))) parents))
+                     "s" subject
+                     "b" body
+                     "B" message
+                     ("an" "aN" "cn" "cN") author-name
+                     ("ae" "aE" "ce" "cE") author-email
+                     (commit-date-string commit (subs code 1)))))))
+
 (defn- git-blob-oid
   "Compute Git's canonical SHA-1 blob ID without assembling chunked content."
   [conn {:keys [content size]}]
@@ -1176,17 +1239,9 @@
         (fn [commit]
           (let [id (str (:geschichte.commit/id commit))
                 message (:geschichte.commit/message commit)
-                author (:geschichte.commit/author commit)
-                [_ author-name author-email]
-                (or (re-matches #"^(.*?) <(.*?)>$" author)
-                    [nil author ""])]
+                author (:geschichte.commit/author commit)]
             (if format-option
-              (str (-> format-option
-                       (str/replace "%H" id)
-                       (str/replace "%h" (subs id 0 8))
-                       (str/replace "%s" message)
-                       (str/replace "%an" author-name)
-                       (str/replace "%ae" author-email)) "\n")
+              (str (expand-commit-format format-option commit) "\n")
               (if oneline?
                 (str (subs id 0 8) " " message "\n")
                 (str "commit " id "\n"
@@ -1846,10 +1901,7 @@
             message (:geschichte.commit/message commit)
             header (cond
                      (some? format-option)
-                     (str (-> format-option
-                              (str/replace "%H" (str (:geschichte.commit/id commit)))
-                              (str/replace "%h" (subs (str (:geschichte.commit/id commit)) 0 8))
-                              (str/replace "%s" message))
+                     (str (expand-commit-format format-option commit)
                           (when-not (str/blank? format-option) "\n"))
                      (some #{"--oneline"} options)
                      (str (subs (str (:geschichte.commit/id commit)) 0 8)
