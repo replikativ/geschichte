@@ -1,8 +1,7 @@
 {:paths ["src" "resources"]
 
  :deps {org.clojure/clojure      {:mvn/version "1.12.5"}
-        org.replikativ/datahike  {:mvn/version "0.8.1865"
-                                  :exclusions [is.simm/partial-cps]}
+        org.replikativ/datahike  {:mvn/version "0.8.1904"}
         ;; Pin the streaming hash API used by large-file ingestion. The CLJS
         ;; compiler itself is supplied only by Geschichte's CLJS aliases.
         ;; Keep at or above what the Datahike pin above requires: top-level
@@ -12,8 +11,7 @@
         ;; Geschichte uses Konserve's public blob API directly; native-only
         ;; exclusions below retain the CLJS dependencies for browser and Node.
         org.replikativ/konserve  {:mvn/version "0.9.391"}
-        ;; partial-cps moved to org.replikativ (namespaces unchanged); the old
-        ;; is.simm jar is excluded where a dependency still pulls it.
+        ;; partial-cps moved to org.replikativ (namespaces unchanged).
         org.replikativ/partial-cps {:mvn/version "0.1.68"}
         org.clojure/core.async   {:mvn/version "1.6.681"}
         org.clojure/tools.cli    {:mvn/version "1.1.230"}
@@ -70,7 +68,7 @@
 
   :native-runtime
   {:override-deps
-   {org.replikativ/datahike {:mvn/version "0.8.1865"
+   {org.replikativ/datahike {:mvn/version "0.8.1904"
                              :exclusions [com.github.pkpkpk/cljs-cache]}
     org.replikativ/konserve {:mvn/version "0.9.391"
                              :exclusions [org.clojure/clojurescript
