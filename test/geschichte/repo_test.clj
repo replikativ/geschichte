@@ -99,6 +99,41 @@
       (is (= "refs/heads/feature" (repo/current-ref conn)))
       (finally (cleanup f)))))
 
+(deftest restaging-deleted-paths-is-idempotent-before-and-after-commit
+  (let [{:keys [conn] :as f} (fixture)]
+    (try
+      (repo/init! conn)
+      (repo/write! conn "removed.txt" (->bytes "original"))
+      (repo/stage-all! conn)
+      (repo/commit! conn {:message "base"})
+      (repo/remove! conn "removed.txt")
+      (repo/stage! conn ["removed.txt"])
+      (is (= ["removed.txt"] (:staged (repo/status conn))))
+      (repo/stage! conn ["removed.txt"])
+      (repo/stage-all! conn)
+      (is (= ["removed.txt"] (:staged (repo/status conn))))
+      (is (= :deleted (:index (first (repo/status-entries conn)))))
+      (repo/commit! conn {:message "delete"})
+      (is (:clean? (repo/status conn)))
+      ;; The index retains the deletion marker after commit. Neither named
+      ;; staging nor the next `git add .` may retract [:content/id nil].
+      (repo/stage! conn ["removed.txt" "never-existed.txt"])
+      (repo/stage-all! conn)
+      (is (:clean? (repo/status conn)))
+      (is (nil? (repo/read conn "removed.txt")))
+      (repo/write! conn "new.txt" (->bytes "new"))
+      (repo/stage-all! conn)
+      (is (= ["new.txt"] (:staged (repo/status conn))))
+      (repo/commit! conn {:message "next"})
+      (is (:clean? (repo/status conn)))
+      (is (= #{"new.txt"} (set (keys (repo/tree conn :head)))))
+      (repo/write! conn "removed.txt" (->bytes "restored"))
+      (repo/stage-all! conn)
+      (repo/commit! conn {:message "restore"})
+      (is (= "restored" (text (repo/read conn "removed.txt"))))
+      (is (:clean? (repo/status conn)))
+      (finally (cleanup f)))))
+
 (deftest restore-reset-and-delete-branch
   (let [{:keys [conn] :as f} (fixture)]
     (try
