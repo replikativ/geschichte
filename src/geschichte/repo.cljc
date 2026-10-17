@@ -351,14 +351,18 @@
       :geschichte.stage/size (:geschichte.work/size work)
       :geschichte.stage/mode (:geschichte.work/mode work)}]
     (if-let [stage (stage-row db path)]
-      [[:db/retract (:db/id stage) :geschichte.stage/content
-        [:geschichte.content/id
-         (get-in stage [:geschichte.stage/content :geschichte.content/id])]]
-       [:db/retract (:db/id stage) :geschichte.stage/size
-        (:geschichte.stage/size stage)]
-       [:db/retract (:db/id stage) :geschichte.stage/mode
-        (:geschichte.stage/mode stage)]
-       [:db/add (:db/id stage) :geschichte.stage/state :deleted]]
+      (let [eid (:db/id stage)
+            content-id (get-in stage [:geschichte.stage/content :geschichte.content/id])
+            size (:geschichte.stage/size stage)
+            mode (:geschichte.stage/mode stage)]
+        ;; Deletion markers remain in the index after commit. Re-staging
+        ;; them must not emit a lookup ref for content that is already gone
+        ;; (or nil-valued scalar retractions).
+        (cond-> [[:db/add eid :geschichte.stage/state :deleted]]
+          content-id (conj [:db/retract eid :geschichte.stage/content
+                            [:geschichte.content/id content-id]])
+          (some? size) (conj [:db/retract eid :geschichte.stage/size size])
+          (some? mode) (conj [:db/retract eid :geschichte.stage/mode mode])))
       [])))
 
 (defn stage! [conn paths]
