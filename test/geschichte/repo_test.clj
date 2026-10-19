@@ -2,7 +2,8 @@
   (:refer-clojure :exclude [read remove])
   (:require [clojure.test :refer [deftest is testing]]
             [datahike.api :as d]
-            [geschichte.repo :as repo]))
+            [geschichte.repo :as repo]
+            [geschichte.workspace :as workspace]))
 
 (defn- ->bytes [s] (.getBytes ^String s "UTF-8"))
 (defn- text [bs] (when bs (String. ^bytes bs "UTF-8")))
@@ -55,6 +56,107 @@
       (repo/commit! conn {:message "second" :author "Ada"})
       (is (= ["second" "initial"]
              (mapv :geschichte.commit/message (repo/log conn))))
+      (finally (cleanup f)))))
+
+(deftest prepared-commit-publishes-with-an-application-receipt
+  (let [{:keys [conn] :as f} (fixture)]
+    (try
+      (repo/init! conn)
+      (d/transact conn [{:db/ident :test/publication :db/valueType :db.type/uuid
+                         :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+                        {:db/ident :test/commit :db/valueType :db.type/uuid
+                         :db/cardinality :db.cardinality/one}])
+      (repo/write! conn "wiki/brief.md" (->bytes "# Brief"))
+      (repo/stage! conn ["wiki/brief.md"])
+      (repo/write! conn "private-draft.txt" (->bytes "Unstaged work"))
+      (let [before (d/commit-id @conn)
+            plan (repo/prepare-commit conn {:message "Publish brief" :author "Ada"})
+            operation (random-uuid)
+            commit-id (get-in plan [:commit :geschichte.commit/id])
+            publish (fn [db plan operation]
+                      ;; Dedup first: a lost acknowledgement can be recovered
+                      ;; even when the DB has moved since publication.
+                      (if (d/entity db [:test/publication operation])
+                        []
+                        (conj (repo/prepared-commit-tx db plan)
+                              {:test/publication operation :test/commit commit-id})))]
+        (is (= before (d/commit-id @conn)) "Preparation is read-only")
+        (is (false? (:noop? plan)))
+        (d/transact conn [[:db.fn/call publish plan operation]])
+        (is (= commit-id (:geschichte.commit/id (repo/head-commit conn))))
+        (is (= commit-id (:test/commit (d/entity @conn [:test/publication operation]))))
+        (is (= "# Brief" (text (repo/read-at conn commit-id "wiki/brief.md"))))
+        (is (= "Unstaged work" (text (repo/read conn "private-draft.txt"))))
+        (is (nil? (repo/read-at conn commit-id "private-draft.txt")))
+        (repo/set-config! conn "later" "change")
+        (d/transact conn [[:db.fn/call publish plan operation]])
+        (is (= commit-id (:geschichte.commit/id (repo/head-commit conn)))))
+      (finally (cleanup f)))))
+
+(deftest prepared-commit-refuses-any-intervening-transaction
+  (let [{:keys [conn] :as f} (fixture)]
+    (try
+      (repo/init! conn)
+      (repo/write! conn "a.md" (->bytes "one"))
+      (repo/stage-all! conn)
+      (let [plan (repo/prepare-commit conn {:message "One"})]
+        (repo/set-config! conn "unrelated" "still invalidates")
+        (is (thrown? Exception
+                     (d/transact conn [[:db.fn/call repo/prepared-commit-tx plan]])))
+        (is (nil? (repo/head-commit conn))))
+      (finally (cleanup f)))))
+
+(deftest prepared-publication-is-bound-to-its-physical-workspace
+  (let [{:keys [conn cfg] :as f} (fixture)]
+    (try
+      (repo/init! conn)
+      (repo/write! conn "a.md" (->bytes "one"))
+      (repo/stage-all! conn)
+      (let [plan (repo/prepare-commit conn {:message "One"})]
+        (workspace/fork! conn "other")
+        (let [other (d/connect (assoc cfg :branch :geschichte.workspace/other))]
+          (try
+            (is (= (d/commit-id @conn) (d/commit-id @other)))
+            (is (thrown? Exception (repo/prepared-commit-tx @other plan)))
+            (is (seq (repo/prepared-commit-tx @conn plan)))
+            (finally (d/release other)))))
+      (finally (cleanup f)))))
+
+(deftest prepared-publication-with-existing-head-and-merge-refusal
+  (let [{:keys [conn] :as f} (fixture)]
+    (try
+      (repo/init! conn)
+      (repo/write! conn "a.md" (->bytes "one"))
+      (repo/stage-all! conn)
+      (let [base (repo/commit! conn {:message "Base"})
+            noop (repo/prepare-commit conn {:message "Unchanged"})]
+        (is (:noop? noop))
+        (is (= [] (repo/prepared-commit-tx @conn noop)))
+        (repo/write! conn "a.md" (->bytes "two"))
+        (repo/stage-all! conn)
+        (let [plan (repo/prepare-commit conn {:message "Second"})]
+          (is (= [[:geschichte.commit/id (:geschichte.commit/id base)]]
+                 (get-in plan [:commit :geschichte.commit/parents])))
+          (d/transact conn [[:db.fn/call repo/prepared-commit-tx plan]])
+          (is (= "two" (text (repo/read-at conn (get-in plan [:commit :geschichte.commit/id]) "a.md")))))
+        (d/transact conn [[:db/add [:geschichte.repo/id (:geschichte.repo/id
+                                                         (d/q '[:find (pull ?r [*]) . :where [?r :geschichte.repo/id]] @conn))]
+                           :geschichte.repo/merge-parent [:geschichte.commit/id (:geschichte.commit/id base)]]])
+        (is (thrown? Exception (repo/prepare-commit conn {:message "Not a merge"}))))
+      (finally (cleanup f)))))
+
+(deftest prepared-noop-validates-without-creating-a-logical-commit
+  (let [{:keys [conn] :as f} (fixture)]
+    (try
+      (repo/init! conn)
+      (let [plan (repo/prepare-commit conn {:message "No changes"})]
+        (is (:noop? plan))
+        (is (nil? (:commit plan)))
+        (is (= [] (repo/prepared-commit-tx @conn plan)))
+        (repo/set-config! conn "unrelated" "change")
+        (is (thrown? Exception (repo/prepared-commit-tx @conn plan))))
+      (is (nil? (repo/head-commit conn)))
+      (is (thrown? Exception (repo/prepare-commit conn {:message "Amend" :amend? true})))
       (finally (cleanup f)))))
 
 (deftest branches-checkout-and-deletion

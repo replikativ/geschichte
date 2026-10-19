@@ -465,6 +465,81 @@
        (await (transact-data conn tx-data))
        (assoc commit :geschichte.ref/name ref-name)))))
 
+(defn- publication-workspace [db]
+  {:store (select-keys (get-in db [:config :store]) [:backend :id])
+   :branch (get-in db [:config :branch])})
+
+(defn prepare-commit
+  "Prepare an ordinary commit (or explicit no-op) from ONE immutable DB.
+
+   Finish staging and any application metadata/schema changes before calling.
+   Publish using `prepared-commit-tx` inside the actual serialized transaction;
+   callers may append their own receipt in that same transaction. Any intervening
+   transaction invalidates this short-lived plan, even an unrelated one. It is
+   not a durable queue item or a history-retention pin. Amend and pending merges
+   are deliberately unsupported. Preparation does not mutate the repository."
+  [conn {:keys [message author time amend?] :or {author "unknown"}}]
+  (platform-async
+   (when (or amend? (str/blank? message))
+     (throw (ex-info "Prepared commits require a message and do not support amend"
+                     {:type ::invalid-preparation})))
+   (let [db @conn
+         repository (query/repository db)
+         ref-name (query/current-ref db)
+         head (:geschichte.ref/target (ref-entity db ref-name))
+         snapshot (d/commit-id db)]
+     (when-not (and repository ref-name snapshot)
+       (throw (ex-info "Repository is not initialized" {:type ::invalid-preparation})))
+     (when (:geschichte.repo/merge-parent repository)
+       (throw (ex-info "Prepared commits do not support pending merges"
+                       {:type ::invalid-preparation})))
+     (let [index (stage-map db)
+           head-tree (if head (stage-map (await (snapshot-db db head))) {})
+           noop? (= index head-tree)
+           commit (when-not noop?
+                    (cond-> {:geschichte.commit/id (random-uuid)
+                             :geschichte.commit/snapshot snapshot
+                             :geschichte.commit/message message
+                             :geschichte.commit/author author
+                             :geschichte.commit/time
+                             (or time #?(:clj (java.util.Date.) :cljs (js/Date.)))}
+                      head (assoc :geschichte.commit/parents
+                                  [[:geschichte.commit/id (:geschichte.commit/id head)]])))]
+       {:version 1 :repository (:geschichte.repo/id repository)
+        :workspace (publication-workspace db)
+        :checkpoint snapshot :ref ref-name :head (:geschichte.commit/id head)
+        :index index :worktree (query/worktree db)
+        :noop? noop? :commit commit}))))
+
+(defn prepared-commit-tx
+  "Validate a trusted host-prepared plan against the transaction's input DB,
+   returning only commit/ref tx data (empty for a validated no-op). Invoke this
+   INSIDE a Datahike transaction function, never as a preflight followed by a
+   separate transact. Application receipt deduplication must happen BEFORE
+   validation, so a completed publication can be recovered after later edits."
+  [db {:keys [version repository workspace checkpoint ref head index worktree noop? commit] :as plan}]
+  (when-not (and (= 1 version)
+                 (= repository (:geschichte.repo/id (query/repository db)))
+                 (= workspace (publication-workspace db))
+                 (= checkpoint (d/commit-id db))
+                 (= ref (query/current-ref db))
+                 (= head (get-in (ref-entity db ref) [:geschichte.ref/target :geschichte.commit/id]))
+                 (= index (stage-map db))
+                 (= worktree (query/worktree db))
+                 (nil? (:geschichte.repo/merge-parent (query/repository db)))
+                 (if noop? (nil? commit)
+                     (and (uuid? (:geschichte.commit/id commit))
+                          (= checkpoint (:geschichte.commit/snapshot commit))
+                          (= (when head [[:geschichte.commit/id head]])
+                             (:geschichte.commit/parents commit)))))
+    (throw (ex-info "Prepared publication basis is stale or invalid"
+                    {:type ::stale-preparation :repository repository :ref ref
+                     :checkpoint checkpoint})))
+  (if (:noop? plan)
+    []
+    [commit {:geschichte.ref/name ref
+             :geschichte.ref/target [:geschichte.commit/id (:geschichte.commit/id commit)]}]))
+
 (defn create-ref!
   "Create a logical ref at `commit` (or current HEAD when omitted)."
   ([conn name] (create-ref! conn name nil))

@@ -82,6 +82,36 @@
                  (<! (d/delete-database cfg))
                  (done)))))))
 
+(deftest node-prepared-publication
+  (async done
+         (go
+           (let [cfg {:store {:backend :memory :id (random-uuid)}
+                      :schema-flexibility :write :keep-history? true :commit-graph? true}
+                 owned (atom nil)]
+             (try
+               (<! (d/create-database cfg))
+               (let [conn (<! (d/connect cfg {:sync? false}))]
+                 (reset! owned conn)
+                 (bridge/unwrap-result (<! (take-cps (repo/init! conn))))
+                 (bridge/unwrap-result
+                  (<! (take-cps (repo/write! conn "wiki/brief.md" (bytes/utf8 "# Brief")))))
+                 (bridge/unwrap-result (<! (take-cps (repo/stage-all! conn))))
+                 (let [plan (bridge/unwrap-result
+                             (<! (take-cps (repo/prepare-commit conn {:message "Brief"}))))
+                       tx (<! (d/transact! conn [[:db.fn/call repo/prepared-commit-tx plan]]))]
+                   (when (instance? js/Error tx) (throw tx))
+                   (is (= (get-in plan [:commit :geschichte.commit/id])
+                          (:geschichte.commit/id (repo/head-commit conn))))
+                   (let [noop (bridge/unwrap-result
+                               (<! (take-cps (repo/prepare-commit conn {:message "No change"}))))]
+                     (is (:noop? noop))
+                     (is (= [] (repo/prepared-commit-tx @conn noop))))))
+               (catch :default error (is false (str "Prepared publication failed: " error)))
+               (finally
+                 (when-let [conn @owned] (d/release conn))
+                 (<! (d/delete-database cfg))
+                 (done)))))))
+
 (deftest node-logical-commits-branches-and-checkout
   (async done
          (go
