@@ -507,7 +507,8 @@
                                   [[:geschichte.commit/id (:geschichte.commit/id head)]])))]
        {:version 1 :repository (:geschichte.repo/id repository)
         :workspace (publication-workspace db)
-        :checkpoint snapshot :ref ref-name :head (:geschichte.commit/id head)
+        :checkpoint snapshot :max-tx (:max-tx db)
+        :ref ref-name :head (:geschichte.commit/id head)
         :index index :worktree (query/worktree db)
         :noop? noop? :commit commit}))))
 
@@ -517,11 +518,12 @@
    INSIDE a Datahike transaction function, never as a preflight followed by a
    separate transact. Application receipt deduplication must happen BEFORE
    validation, so a completed publication can be recovered after later edits."
-  [db {:keys [version repository workspace checkpoint ref head index worktree noop? commit] :as plan}]
+  [db {:keys [version repository workspace checkpoint max-tx ref head index worktree noop? commit] :as plan}]
   (when-not (and (= 1 version)
                  (= repository (:geschichte.repo/id (query/repository db)))
                  (= workspace (publication-workspace db))
                  (= checkpoint (d/commit-id db))
+                 (= max-tx (:max-tx db))
                  (= ref (query/current-ref db))
                  (= head (get-in (ref-entity db ref) [:geschichte.ref/target :geschichte.commit/id]))
                  (= index (stage-map db))

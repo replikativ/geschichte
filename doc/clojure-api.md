@@ -67,8 +67,10 @@ plan. Authorization still belongs to the host application.
 
 The plan binds its store identity and physical workspace branch, not only the
 logical Git ref: a freshly forked workspace can share the same checkpoint.
-The first API deliberately requires the exact physical Datahike checkpoint to
-remain current. Any intervening transaction invalidates the plan, including
+The first API deliberately requires the exact physical Datahike checkpoint and
+transaction number to remain current. The latter also distinguishes provisional
+transactions within a writer batch that still share checkpoint metadata.
+Any intervening transaction invalidates the plan, including
 unrelated metadata changes. Finish schema, file writes, staging, and application
 metadata before preparing. Existing unstaged files are preserved. A no-op returns
 no commit/ref datoms, but still validates the same basis and can carry a receipt.
