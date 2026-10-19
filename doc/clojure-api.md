@@ -53,6 +53,28 @@ Payload bytes are intentionally store refs, not indexed inline values. Query
 metadata first and load bytes through `repo/read`, `repo/read-entry`, or Konserve
 blob access only when required.
 
+## Atomic publication with application receipts
+
+`prepare-commit` captures one immutable repository DB after staging. It returns
+a short-lived plan for an ordinary commit or a validated no-op; it does not
+transact. Amend and pending merges are refused.
+
+Call `prepared-commit-tx` **inside** a Datahike transaction function and append
+application receipt data to its returned vector. Commit, logical ref, and receipt
+then publish together. For idempotent recovery, look up the operation receipt
+first: a duplicate must return the winning receipt without revalidating an old
+plan. Authorization still belongs to the host application.
+
+The plan binds its store identity and physical workspace branch, not only the
+logical Git ref: a freshly forked workspace can share the same checkpoint.
+The first API deliberately requires the exact physical Datahike checkpoint to
+remain current. Any intervening transaction invalidates the plan, including
+unrelated metadata changes. Finish schema, file writes, staging, and application
+metadata before preparing. Existing unstaged files are preserved. A no-op returns
+no commit/ref datoms, but still validates the same basis and can carry a receipt.
+Plans are not durable queued work or history-retention pins; do not persist one
+and assume its historical content survives future garbage collection.
+
 ## Async portability
 
 JVM calls return direct values. Effectful CLJS calls return partial-CPS awaitable
