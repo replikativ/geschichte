@@ -106,6 +106,22 @@
         (is (nil? (repo/head-commit conn))))
       (finally (cleanup f)))))
 
+(deftest prepared-publication-refuses-provisional-transactions-sharing-a-checkpoint
+  (let [{:keys [conn] :as f} (fixture)]
+    (try
+      (repo/init! conn)
+      (repo/write! conn "a.md" (->bytes "one"))
+      (repo/stage-all! conn)
+      (let [plan (repo/prepare-commit conn {:message "One"})
+            provisional (:db-after (d/with @conn [{:geschichte.config/key "unrelated"
+                                                   :geschichte.config/value "changed"}]))]
+        (is (= (:checkpoint plan) (d/commit-id provisional))
+            "Batched input can retain the persisted checkpoint metadata")
+        (is (< (:max-tx plan) (:max-tx provisional)))
+        (is (thrown? Exception (repo/prepared-commit-tx provisional plan)))
+        (is (seq (repo/prepared-commit-tx @conn plan))))
+      (finally (cleanup f)))))
+
 (deftest prepared-publication-is-bound-to-its-physical-workspace
   (let [{:keys [conn cfg] :as f} (fixture)]
     (try
