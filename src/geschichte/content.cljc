@@ -204,6 +204,95 @@
                           (consume! value))))
                     true))))))
 
+(defn- range-integer? [value]
+  #?(:clj (and (integer? value) (<= 0 value Long/MAX_VALUE))
+     :cljs (and (number? value) (js/Number.isSafeInteger value) (<= 0 value))))
+
+(defn- range-chunks
+  "Validate the complete logical manifest before reading any payload."
+  [entity logical-size]
+  (let [chunks (or (:geschichte.content/chunks entity) [])
+        invalid! #(throw (ex-info "Invalid content chunk manifest"
+                                  {:content (:geschichte.content/id entity)}))]
+    (when-not (and (coll? chunks)
+                   (every? #(and (range-integer? (:geschichte.chunk/index %))
+                                 (range-integer? (:geschichte.chunk/offset %))
+                                 (range-integer? (:geschichte.chunk/size %))
+                                 (pos? (:geschichte.chunk/size %))
+                                 (uuid? (:geschichte.chunk/payload %))) chunks))
+      (invalid!))
+    (let [ordered (vec (sort-by :geschichte.chunk/index chunks))]
+      (loop [remaining (seq ordered) index 0 offset 0]
+        (if-let [chunk (first remaining)]
+          (let [size (:geschichte.chunk/size chunk)]
+            (when-not (and (= index (:geschichte.chunk/index chunk))
+                           (= offset (:geschichte.chunk/offset chunk))
+                           (<= size (- logical-size offset)))
+              (invalid!))
+            (recur (next remaining) (inc index) (+ offset size)))
+          (when-not (= offset logical-size) (invalid!))))
+      ordered)))
+
+(defn consume-range-by-id!
+  "Pass exactly `length` logical bytes starting at `offset` to `consume!`.
+
+   Chunked content fetches only overlapping payloads, validating the entire
+   manifest and each selected chunk's hash/size. It does not recompute the
+   complete logical content hash; the DB manifest is the trusted index.
+   Full/delta content reconstructs and verifies the whole value before slicing,
+   which can be large for historical or custom-threshold representations.
+
+   Uses one immutable DB snapshot. Empty ranges validate metadata but fetch no
+   payload and do not invoke the consumer. Return `stop-consumption` to stop
+   after the current slice; `:async-consumer?` has the same partial-CPS contract
+   as `consume-by-id!`. Callers retain authority, lifetime and GC protection."
+  ([conn id offset length consume!]
+   (consume-range-by-id! conn id offset length consume! nil))
+  ([conn id offset length consume! provided-opts]
+   (when-not (and (uuid? id) (range-integer? offset) (range-integer? length) (ifn? consume!))
+     (throw (ex-info "Invalid logical content range" {:content id :offset offset :length length})))
+   (let [opts (execution/opts provided-opts)]
+     (async+sync (:sync? opts)
+                 (async
+                  (let [snapshot (atom @conn)
+                        entity (or (content-entity @snapshot id)
+                                   (throw (ex-info "Unknown content" {:content id})))
+                        size (:geschichte.content/size entity)
+                        _ (when-not (and (range-integer? size) (<= offset size)
+                                         (<= length (- size offset)))
+                            (throw (ex-info "Logical content range is outside the file"
+                                            {:content id :offset offset :length length :size size})))
+                        kind (:geschichte.content/kind entity)
+                        _ (when-not (#{:chunks :full :line-delta} kind)
+                            (throw (ex-info "Unknown content representation" {:content id :kind kind})))
+                        chunks (when (= :chunks kind) (range-chunks entity size))
+                        end (+ offset length)]
+                    (when (pos? length)
+                      (if (= :chunks kind)
+                        (loop [remaining (seq (filter #(and (< (:geschichte.chunk/offset %) end)
+                                                            (> (+ (:geschichte.chunk/offset %)
+                                                                  (:geschichte.chunk/size %)) offset)) chunks))]
+                          (when-let [chunk (first remaining)]
+                            (let [value (await (checked-payload snapshot (:geschichte.chunk/payload chunk) opts))
+                                  start (:geschichte.chunk/offset chunk)
+                                  chunk-size (:geschichte.chunk/size chunk)
+                                  _ (when-not (= chunk-size (bytes/length value))
+                                      (throw (ex-info "Content chunk size mismatch" {:content id :index (:geschichte.chunk/index chunk)})))
+                                  slice (bytes/slice value (max 0 (- offset start)) (min chunk-size (- end start)))
+                                  result (if (:async-consumer? opts)
+                                           (await (consume! slice))
+                                           (consume! slice))]
+                              (when-not (= stop-consumption result)
+                                (recur (next remaining))))))
+                        (let [value (await (read-by-id snapshot id opts))
+                              _ (when-not (= size (bytes/length value))
+                                  (throw (ex-info "Logical content size mismatch" {:content id})))
+                              slice (bytes/slice value offset end)]
+                          (if (:async-consumer? opts)
+                            (await (consume! slice))
+                            (consume! slice)))))
+                    true))))))
+
 (defn- choose-representation [conn value base-id provided-opts]
   (let [opts (merge default-options (execution/opts provided-opts))]
     (async+sync (:sync? opts)

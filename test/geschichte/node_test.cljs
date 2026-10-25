@@ -3,6 +3,7 @@
             [geschichte.async-node-test]
             [geschichte.chunk-test]
             [geschichte.content-node-test]
+            [geschichte.content-range-node-test]
             [geschichte.diff-test]
             [geschichte.fs-node-test]
             [geschichte.ignore-node-test]
@@ -26,6 +27,7 @@
   (test/run-tests 'geschichte.async-node-test
                   'geschichte.chunk-test
                   'geschichte.content-node-test
+                  'geschichte.content-range-node-test
                   'geschichte.diff-test
                   'geschichte.fs-node-test
                   'geschichte.ignore-node-test
