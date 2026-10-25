@@ -19,7 +19,7 @@
   #?(:clj (:require [geschichte.macros :refer [async+sync]]
                     [is.simm.partial-cps.async :refer [async]]
                     [clojure.java.io :as io]))
-  #?(:clj (:import [java.io File FileInputStream FilterInputStream OutputStream]
+  #?(:clj (:import [java.io File FileInputStream FilterInputStream InputStream OutputStream]
                    [java.nio ByteBuffer]
                    [java.nio.charset CharacterCodingException CodingErrorAction
                     StandardCharsets]
@@ -565,6 +565,83 @@
                       (publish! (:buffer @state) (:used @state)))
                     (:chunks @state))]
        [stream flush!])))
+
+#?(:clj
+   (defn- checked-input-stream
+     "Borrowed exact-size source; overlong reads consume at most expected+1 bytes."
+     [^InputStream source expected]
+     (let [counted (volatile! 0)
+           accept! (fn [n]
+                     (when (pos? n)
+                       (when (> n (- expected @counted))
+                         (throw (ex-info "Stream exceeds its declared size" {:type ::stream-size-mismatch})))
+                       (vswap! counted + n)))
+           read-buffer! (fn [^bytes buffer offset length]
+                          (java.util.Objects/checkFromIndexSize (int offset) (int length) (alength buffer))
+                          (if (zero? length) 0
+                              (let [remaining (- expected @counted)
+                                    limit (if (<= length remaining) length (inc remaining))
+                                    n (.read source buffer (int offset) (int limit))]
+                                (accept! n)
+                                n)))
+           stream (proxy [FilterInputStream] [source]
+                    (read
+                      ([] (let [value (.read source)] (when-not (neg? value) (accept! 1)) value))
+                      ([buffer] (read-buffer! buffer 0 (alength ^bytes buffer)))
+                      ([buffer offset length] (read-buffer! buffer offset length)))
+                    (skip [_] (throw (java.io.IOException. "Checked stream does not support skip")))
+                    (markSupported [] false)
+                    (mark [_] nil)
+                    (reset [] (throw (java.io.IOException. "Checked stream does not support reset")))
+                    (close [] nil))]
+       [stream counted])))
+
+#?(:clj
+   (defn transact-stream!
+     "Ingest a borrowed finite binary InputStream with exact expected size.
+
+     Always content-defined-chunked; existing byte/file selection is unchanged.
+     Hash and byte count are verified before `tx-fn` or metadata publication,
+     including known-content reuse. Optional `:expected-content` constrains the
+     logical UUID. The caller owns/closes the source and retains storage/GC
+     lifetime. Failure may leave unreferenced payloads for normal GC."
+     ([conn source expected-size tx-fn]
+      (transact-stream! conn source expected-size tx-fn nil))
+     ([conn source expected-size tx-fn provided-opts]
+      (let [opts (merge default-options (execution/opts provided-opts))
+            expected-content (:expected-content opts)]
+        (when-not (and (instance? InputStream source) (fn? tx-fn)
+                       (integer? expected-size) (<= 0 expected-size Long/MAX_VALUE)
+                       (or (not (contains? opts :expected-content)) (uuid? expected-content)))
+          (throw (ex-info "Invalid checked stream arguments" {:type ::invalid-stream})))
+        (when-not (:sync? opts)
+          (throw (ex-info "Asynchronous JVM stream ingestion is not implemented" {:type ::invalid-stream})))
+        (let [compiled (chunk/options opts)
+              sid (store-id conn) token (guard/writing! sid)]
+          (try
+            (let [[bounded counted] (checked-input-stream source expected-size)
+                  [in flush!] (chunking-input-stream conn bounded compiled opts)
+                  id (blob/blob-id in)]
+              ;; Require EOF even if a future hash implementation stops early.
+              (when-not (neg? (.read ^InputStream bounded))
+                (throw (ex-info "Hash did not consume the complete stream" {:type ::stream-size-mismatch})))
+              (when-not (= expected-size @counted)
+                (throw (ex-info "Stream is shorter than its declared size" {:type ::stream-size-mismatch})))
+              (when (and expected-content (not= expected-content id))
+                (throw (ex-info "Stream content identity changed" {:type ::stream-content-mismatch})))
+              (let [chunks (flush!) existing (content-entity @conn id)]
+                (when (and existing (not= expected-size (:geschichte.content/size existing)))
+                  (throw (ex-info "Stored content size disagrees with checked stream" {:type ::stream-size-mismatch})))
+                (if existing
+                  (transact-data conn (vec (tx-fn id)) opts)
+                  (transact-data conn
+                                 (into [(merge {:geschichte.content/id id
+                                                :geschichte.content/depth 0
+                                                :geschichte.content/size (long @counted)}
+                                               (chunk-metadata compiled chunks))]
+                                       (tx-fn id)) opts))
+                id))
+            (finally (guard/done! sid token))))))))
 
 #?(:clj
    (defn transact-file!
