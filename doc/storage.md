@@ -29,3 +29,21 @@ leave an unreferenced blob eligible for GC, but not a published dangling referen
 Replication must copy store-ref targets as well as Datahike indices. This is the
 remaining integration requirement for complete large-file transport through
 Datahike/Konserve synchronization.
+
+## Reading byte ranges
+
+`geschichte.content/consume-range-by-id!` accepts a logical content ID, offset,
+length and consumer. It captures one immutable database snapshot and validates
+the complete chunk manifest before fetching only the overlapping payloads. Each
+selected payload is hash- and size-checked; a sparse read does not recompute the
+whole logical file hash. Offsets and lengths must be nonnegative integers within
+the file, and safe integers in ClojureScript. Empty ranges validate metadata
+without loading payloads.
+
+The consumer receives bounded byte slices in order. Returning
+`content/stop-consumption` prevents later payload reads. On ClojureScript,
+`:async-consumer? true` awaits each partial-CPS consumer before proceeding.
+Full or delta representations reconstruct the complete value before slicing;
+historical or custom-threshold values can therefore require more memory. The
+caller remains responsible for authorization, operation lifetime and retaining
+the referenced content against garbage collection.
