@@ -28,6 +28,32 @@ Geschichte deliberately exposes small namespaces rather than one generated API.
 Directory entities are worktree state. Git/Geschichte commits contain files;
 empty directories are not committed.
 
+## Checked JVM stream ingestion
+
+`geschichte.content/transact-stream!` ingests a borrowed, finite binary
+`InputStream` using content-defined chunks and bounded heap. Supply its exact
+nonnegative byte size and a callback returning the metadata transaction data:
+
+```clojure
+(require '[geschichte.content :as content])
+
+(with-open [source (clojure.java.io/input-stream finalized-file)]
+  (content/transact-stream! conn source expected-size
+    (fn [id] [{:attachment/id attachment-id
+               :attachment/content [:geschichte.content/id id]}])
+    {:expected-content inspected-content-id}))
+```
+
+The optional expected content UUID, complete hash, and actual byte count must
+agree before the callback runs or metadata is published, even when the content
+already exists. A source longer than declared consumes at most one extra byte
+before refusal. The API does not close the caller's source. The caller retains
+the source's exclusive finalized-file ownership and the database/GC lifetime
+through the synchronous call. This does not provide an authority gate or a
+worktree compare-and-swap: include the appropriate guard in the callback's
+transaction data. Failure can leave unreferenced payloads for ordinary GC.
+Existing file/byte ingestion APIs retain their representation-selection rules.
+
 ## Datalog
 
 The query namespace returns stable maps for common UI/application needs, while
