@@ -10,6 +10,17 @@
 (defn- take-cps [computation]
   (bridge/->chan computation))
 
+(deftest node-checkpoint-mode-is-checked-before-source-access
+  (async done
+         (go
+           (try
+             (doseq [operation [(fn [] (workspace/resolve-checkpoint nil nil {:sync? true}))
+                                (fn [] (workspace/fork-at-checkpoint! nil "unused" nil nil {:sync? true}))]]
+               (let [failure (try (bridge/unwrap-result (<! (take-cps (operation)))) nil
+                                  (catch :default error error))]
+                 (is (= ::workspace/invalid-checkpoint-mode (:type (ex-data failure))))))
+             (finally (done))))))
+
 (deftest node-workspace-fork-and-publish
   (async done
          (go

@@ -35,3 +35,45 @@ payloads become eligible for garbage collection.
 
 The optional Yggdrasil adapter maps fork/merge/discard onto this model and lets
 Geschichte participate in Spindel execution contexts.
+
+## Exact database checkpoint origins
+
+A logical commit identifies a committed tree. An exact workspace checkpoint
+also preserves dirty files, staging, refs, schema and other repository datoms.
+Its portable identity is repository-specific:
+
+```clojure
+(def origin {:version 1 :kind :datahike :commit datahike-commit-uuid
+             :source {:store store-uuid :repository repository-uuid}})
+(def snapshot (ws/resolve-checkpoint canonical origin))
+;; Establish native allocation/cleanup ownership before calling the allocator.
+(def branch (ws/fork-at-checkpoint! canonical "historical" origin snapshot))
+(def child (d/connect (assoc cfg :branch branch)))
+(ws/verify-checkpoint-workspace! snapshot @child branch)
+;; Use child; then release its connection and remove the owned branch.
+```
+
+Resolution is read-only and validates source identity and checkpoint availability
+before allocation. The allocator rechecks source/snapshot correspondence and
+returns immediately after the named branch allocation acknowledges; it does not
+connect or perform fallible post-allocation work. A lifecycle owner can therefore
+record that ACK, connect the child, and verify it before exposing the workspace.
+An uncertain allocation must stay owned rather than being replayed or assumed
+absent. Destination collisions preserve the existing branch.
+
+Verification compares a constant number of immutable primary index roots,
+secondary generation addresses, source configuration and database metadata.
+It reads no file bodies and leaves the source untouched. Building secondary
+indices refuse because Datahike omits unfinished generations when branching.
+JVM operations return direct values and CLJS operations return CPS computations;
+explicit unsupported execution modes refuse before source IO.
+
+The origin and resolved immutable DB are neither permission nor a GC lease.
+Callers retain the source and evidence for the promised lifetime. The child is
+writable; its physical branch identity differs intentionally. Logical publication
+and merge retain their existing file/ref semantics. Selecting one repository
+checkpoint does not rewind other repositories or a computation's execution state.
+
+Yggdrasil delegates these repository operations while owning its overlay lifecycle
+and cross-system capability/preflight checks. No reverse dependency on Yggdrasil
+is required to use Geschichte checkpoints.
