@@ -10,6 +10,10 @@
   (:require [clojure.set :as set]
             [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.index.audit :as audit]
+            [datahike.index.interface :as index]
+            [datahike.store :as store]
+            [datahike.versioning :as versioning]
             [geschichte.async :as execution]
             [geschichte.merge.core :as graph]
             [geschichte.query :as query]
@@ -41,6 +45,113 @@
   persistent indices and store-ref payloads remain structurally shared."
   [conn name]
   (repo/fork-workspace! conn (branch-key name)))
+
+(defn checkpoint-origin?
+  "Closed portable identity of an exact repository database state. An origin
+   conveys neither authorization nor GC retention. Logical commits use refs."
+  [value]
+  (and (map? value) (= #{:version :kind :commit :source} (set (keys value)))
+       (= 1 (:version value)) (= :datahike (:kind value)) (uuid? (:commit value))
+       (map? (:source value)) (= #{:store :repository} (set (keys (:source value))))
+       (every? uuid? ((juxt :store :repository) (:source value)))))
+
+(defn- checkpoint-opts! [opts]
+  (when-not (and (or (nil? opts) (map? opts))
+                 (every? #{:sync?} (keys opts))
+                 (or (not (contains? opts :sync?))
+                     (= (:sync? execution/default-opts) (:sync? opts))))
+    (throw (ex-info "Unsupported checkpoint execution mode" {:type ::invalid-checkpoint-mode}))))
+
+(defn- checkpoint-roots [db]
+  ;; Compare a constant number of persisted addresses. In identity-preserving
+  ;; memory stores a shared immutable root object is sufficient. No datom scan.
+  (into {}
+        (for [key (cond-> [:eavt :aevt :avet]
+                    (get-in db [:config :keep-history?])
+                    (into [:temporal-eavt :temporal-aevt :temporal-avet]))
+              :let [tree (get db key)
+                    supported? (and (satisfies? audit/IAuditable tree) (satisfies? index/IIndex tree))
+                    address (when supported? (audit/-merkle-root tree))
+                    root (when (and supported? (nil? address)) (index/-root-node tree))]]
+          (do (when-not (or address root)
+                (throw (ex-info "Checkpoint index has no verifiable root"
+                                {:type ::checkpoint-index-unavailable})))
+              [key {:address address :root root}]))))
+
+(defn- same-checkpoint-roots? [before after]
+  (and (= (set (keys before)) (set (keys after)))
+       (every? (fn [[key {:keys [address root]}]]
+                 (let [other (get after key)]
+                   (if address (= address (:address other))
+                       (and (nil? (:address other)) (identical? root (:root other)))))) before)))
+
+(defn- checkpoint-source! [conn origin db]
+  (when-not (and (checkpoint-origin? origin) db
+                 (= (:commit origin) (d/commit-id db))
+                 (= (get-in origin [:source :store])
+                    (store/store-identity (get-in @conn [:config :store]))
+                    (store/store-identity (get-in db [:config :store])))
+                 (= (get-in origin [:source :repository])
+                    (:geschichte.repo/id (query/repository @conn))
+                    (:geschichte.repo/id (query/repository db))))
+    (throw (ex-info "Geschichte checkpoint source is unavailable" {:type ::checkpoint-unavailable})))
+  ;; Datahike drops unfinished secondary generations when branching. Such a
+  ;; normalization cannot satisfy the exact-workspace contract.
+  (when (some #(= :building (:db.secondary/status %)) (vals (:schema db)))
+    (throw (ex-info "Checkpoint has a building secondary index" {:type ::checkpoint-building-index})))
+  (checkpoint-roots db)
+  db)
+
+(defn resolve-checkpoint
+  "Read and validate an exact origin without allocating a branch, connecting
+   a writer or retaining evidence. Returns the native immutable DB, not a
+   portable proof or capability. Caller owns source lifetime and retention.
+   JVM sync / CLJS CPS; an explicit unsupported mode refuses before source IO."
+  ([conn origin] (resolve-checkpoint conn origin nil))
+  ([conn origin opts]
+   (platform-async
+    (checkpoint-opts! opts)
+    (when-not (checkpoint-origin? origin)
+      (throw (ex-info "Invalid Geschichte checkpoint origin" {:type ::invalid-checkpoint})))
+    (checkpoint-source! conn origin
+                        (await (execution/io-result
+                                (versioning/commit-as-db conn (:commit origin) execution/default-opts)
+                                execution/default-opts))))))
+
+(defn fork-at-checkpoint!
+  "Allocate ONLY a named physical workspace from an already resolved native
+   DB. Source/origin correspondence is rechecked; a plain map is not a proof.
+   Return immediately after allocation ACK, before connect/child verification.
+   Caller must own construction cleanup before invoking: a thrown allocation
+   can have created the branch. Never infer absence or blindly replay it.
+   Resolve before acquiring allocation ownership, then connect the acknowledged
+   branch and call verify-checkpoint-workspace!. No parent checkout/reset."
+  ([conn name origin db] (fork-at-checkpoint! conn name origin db nil))
+  ([conn name origin db opts]
+   (platform-async
+    (checkpoint-opts! opts)
+    (checkpoint-source! conn origin db)
+    (let [branch (branch-key name)]
+      (when (= canonical-branch branch)
+        (throw (ex-info "Cannot allocate over the canonical workspace" {:type ::invalid-checkpoint-destination})))
+      (await (execution/io-result
+              (versioning/branch! conn (d/commit-id db) branch execution/default-opts)
+              execution/default-opts))
+      branch))))
+
+(defn verify-checkpoint-workspace!
+  "Pure connected-child verification against the resolved immutable DB.
+   A new physical branch identity is intentional; repository data, source
+   configuration and index generations must remain exact. No files are read."
+  [db child branch]
+  (let [state #(select-keys % [:hash :max-tx :max-eid :op-count :schema :secondary-index-keys])]
+    (when-not (and (= (d/commit-id db) (d/commit-id child))
+                   (= (state db) (state child))
+                   (same-checkpoint-roots? (checkpoint-roots db) (checkpoint-roots child))
+                   (= (dissoc (:config db) :branch) (dissoc (:config child) :branch))
+                   (= (branch-key branch) (get-in child [:config :branch])))
+      (throw (ex-info "Checkpoint child changed during construction" {:type ::checkpoint-child-changed}))))
+  child)
 
 (defn prepare-checkout!
   "Prepare a newly forked workspace for Git-shaped `worktree add` options.
