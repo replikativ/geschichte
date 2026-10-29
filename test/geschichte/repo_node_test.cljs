@@ -9,6 +9,55 @@
 (defn- take-cps [computation]
   (bridge/->chan computation))
 
+(deftest node-reset-clears-merge-intent
+  (async done
+         (go
+           (let [cfg {:store {:backend :memory :id (random-uuid)}
+                      :schema-flexibility :write :keep-history? true :commit-graph? true}
+                 owned (atom nil)]
+             (try
+               (<! (d/create-database cfg))
+               (let [conn (<! (d/connect cfg {:sync? false}))]
+                 (reset! owned conn)
+                 (bridge/unwrap-result (<! (take-cps (repo/init! conn))))
+                 (bridge/unwrap-result (<! (take-cps (repo/write! conn "base" (bytes/utf8 "base")))))
+                 (bridge/unwrap-result (<! (take-cps (repo/stage-all! conn))))
+                 (let [base (bridge/unwrap-result (<! (take-cps (repo/commit! conn {:message "base"}))))]
+                   (bridge/unwrap-result (<! (take-cps (repo/write! conn "feature" (bytes/utf8 "feature")))))
+                   (bridge/unwrap-result (<! (take-cps (repo/stage-all! conn))))
+                   (let [feature (bridge/unwrap-result (<! (take-cps (repo/commit! conn {:message "feature"}))))]
+                     (bridge/unwrap-result (<! (take-cps (repo/reset! conn base {:mode :hard}))))
+                     (bridge/unwrap-result (<! (take-cps (repo/write! conn "main" (bytes/utf8 "main")))))
+                     (bridge/unwrap-result (<! (take-cps (repo/stage-all! conn))))
+                     (let [main (bridge/unwrap-result (<! (take-cps (repo/commit! conn {:message "main"}))))
+                           main-tree (bridge/unwrap-result (<! (take-cps (repo/tree-at conn main))))
+                           feature-tree (bridge/unwrap-result (<! (take-cps (repo/tree-at conn feature))))]
+                       (bridge/unwrap-result
+                        (<! (take-cps (repo/prepare-merge! conn {:ours (:geschichte.commit/id main)
+                                                                 :theirs (:geschichte.commit/id feature)
+                                                                 :tree (merge main-tree feature-tree)
+                                                                 :clean? true :conflicts {}}))))
+                       (let [before @conn
+                             error (try (bridge/unwrap-result
+                                         (<! (take-cps (repo/reset! conn main {:mode :soft}))))
+                                        nil (catch :default error error))]
+                         (is (= ::repo/pending-merge-soft-reset (:type (ex-data error))))
+                         (is (= before @conn)))
+                       (bridge/unwrap-result (<! (take-cps (repo/reset! conn main {:mode :mixed}))))
+                       (is (nil? (d/q '[:find ?e . :where [?e :geschichte.repo/merge-parent]] @conn)))
+                       (is (some? (bridge/unwrap-result (<! (take-cps (repo/read conn "feature"))))))
+                       (bridge/unwrap-result (<! (take-cps (repo/stage-all! conn))))
+                       (let [after (bridge/unwrap-result
+                                    (<! (take-cps (repo/commit! conn {:message "ordinary after reset"}))))]
+                         (is (= #{(:geschichte.commit/id main)}
+                                (set (map second (:geschichte.commit/parents after))))))))))
+               (catch :default error
+                 (is false (str "Node pending merge test failed: " (.-message error))))
+               (finally
+                 (when-let [conn @owned] (d/release conn))
+                 (<! (d/delete-database cfg))
+                 (done)))))))
+
 (deftest node-worktree-stage-and-status
   (async done
          (go
