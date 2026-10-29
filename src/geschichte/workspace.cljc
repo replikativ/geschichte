@@ -368,7 +368,6 @@
               (throw (ex-info "Publication is not a fast-forward"
                               {:ref ref :expected canonical-ref :new tip})))
           tree (await (repo/tree-at workspace tip))
-          _ (path-tree/assert-valid! tree)
           transfer (transfer-data @workspace @canonical commits tip tree)
           ref-entity (d/q '[:find ?ref .
                             :in $ ?name
@@ -392,6 +391,7 @@
                         [:geschichte.commit/id tip]])
           workspace-head (d/commit-id @workspace)
           tx-data (conj (:tx-data transfer) ref-update)]
+      (path-tree/assert-valid! tree)
       (await (merge-data canonical #{workspace-head} tx-data))
       {:ref ref
        :old canonical-ref
