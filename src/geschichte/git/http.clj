@@ -77,7 +77,13 @@
                         (.set reading true)
                         (try
                           (let [n (try (f)
-                                       (catch IOException e (check-failure!) (throw e)))]
+                                       (catch IOException e
+                                         (check-failure!)
+                                         ;; Newer JDKs may fire their request
+                                         ;; timer during body reads, before
+                                         ;; the monitor's next checkpoint.
+                                         (budget/check! operation)
+                                         (throw e)))]
                             (check-failure!)
                             n)
                           (finally (.set reading false))))]

@@ -3,6 +3,7 @@
             [geschichte.git.budget :as budget]
             [geschichte.git.http :as http])
   (:import [com.sun.net.httpserver HttpHandler HttpServer]
+           [java.io IOException InputStream]
            [java.net InetSocketAddress]
            [java.util.concurrent CountDownLatch Executors TimeUnit]))
 
@@ -89,3 +90,23 @@
         (reset! cancelled true)
         (is (= ::budget/cancelled (:type (deref call 3000 {:stalled true}))))
         (is (= before (watchdog-count)))))))
+
+(deftest native-request-timeout-cannot-race-away-typed-body-deadline
+  (let [operation (assoc (budget/create {:timeout-ms 1000})
+                         :started (- (System/nanoTime) 2000000000))
+        check! budget/check!
+        closed (atom false)
+        body (proxy [InputStream] []
+               (read [] (throw (IOException. "native request timer closed the body")))
+               (close [] (reset! closed true)))]
+    ;; Simulate the JDK closing its response before our monitor gets to run.
+    ;; The operation-owning reader still must classify its expired deadline.
+    (with-redefs [budget/check! (fn [b]
+                                  (when-not (= "geschichte-http-body-watchdog" (.getName (Thread/currentThread)))
+                                    (check! b)))]
+      (let [failure (try
+                      (with-open [input ((ns-resolve 'geschichte.git.http 'timed-body) body operation 5000)]
+                        (.read ^InputStream input))
+                      nil (catch clojure.lang.ExceptionInfo error (ex-data error)))]
+        (is (= ::budget/deadline-exceeded (:type failure)))
+        (is @closed)))))
