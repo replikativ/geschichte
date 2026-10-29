@@ -5,7 +5,7 @@
             [geschichte.git.object :as object]
             [geschichte.git.store :as store]
             [geschichte.repo :as repo])
-  (:import [java.util Date UUID]))
+  (:import [java.util Arrays Date UUID]))
 
 (defn- stored-object [object-store oid expected-type]
   (let [metadata (or (store/read-object object-store oid)
@@ -19,17 +19,26 @@
 (defn- mode-long [mode]
   (Long/parseLong mode 8))
 
+(defn- validate-entry-name! [prefix {:keys [name name-bytes oid]}]
+  (let [data {:type ::unsupported-entry-name :prefix prefix :name name :oid oid}]
+    (when (contains? #{"." ".." ".git" ".geschichte"} (str/lower-case name))
+      (throw (ex-info "Git tree contains a reserved administrative path"
+                      (assoc data :reason :administrative))))
+    (when (or (str/blank? name) (str/includes? name "/")
+              (str/includes? name "\\") (str/includes? name "\u0000"))
+      (throw (ex-info "Git tree entry name cannot be represented faithfully"
+                      (assoc data :reason :unsupported-component))))
+    (when-not (Arrays/equals ^bytes name-bytes ^bytes (object/utf8 name))
+      (throw (ex-info "Git tree entry name is not lossless UTF-8"
+                      (assoc data :reason :non-utf8))))))
+
 (defn- tree-files
   ([object-store tree-oid object-format]
    (tree-files object-store "" tree-oid object-format))
   ([object-store prefix tree-oid object-format]
    (mapcat
-    (fn [{:keys [mode name oid]}]
-      (let [administrative-name (str/lower-case name)
-            _ (when (contains? #{"." ".." ".git" ".geschichte"}
-                               administrative-name)
-                (throw (ex-info "Git tree contains a reserved administrative path"
-                                {:prefix prefix :name name :oid oid})))
+    (fn [{:keys [mode name oid] :as entry}]
+      (let [_ (validate-entry-name! prefix entry)
             path (if (str/blank? prefix) name (str prefix "/" name))]
         (case mode
           "40000" (tree-files object-store path oid object-format)

@@ -15,6 +15,78 @@
 
 (defn- utf8 [s] (.getBytes ^String s "UTF-8"))
 
+(defn- graph-for-root [root-payload objects]
+  (let [tree-oid (object/object-id :tree root-payload)
+        commit-payload (object/commit-payload
+                        {:tree tree-oid :author "Fixture <fixture@example.test> 0 +0000"
+                         :committer "Fixture <fixture@example.test> 0 +0000" :message "fixture"})
+        commit-oid (object/object-id :commit commit-payload)]
+    {:oid commit-oid :commits {}
+     :objects (assoc objects tree-oid {:type :tree :payload root-payload}
+                     commit-oid {:type :commit :payload commit-payload})}))
+
+(defn- raw-leaf-tree [name-bytes blob-oid]
+  (object/concat-bytes (utf8 "100644 ") name-bytes (byte-array [0]) (object/hex->bytes blob-oid)))
+
+(deftest unsupported-git-components-refuse-instead-of-being-normalized
+  (doseq [name-bytes [(utf8 (str "a" (char 92) "b")) (utf8 "a/b") (utf8 " ") (utf8 "")
+                      (utf8 ".") (utf8 "..") (utf8 ".git") (utf8 ".Geschichte")
+                      (byte-array [(unchecked-byte 0x80)]) (byte-array [(unchecked-byte 0x81)])]]
+    (let [cfg (config)]
+      (d/create-database cfg)
+      (let [conn (d/connect cfg)]
+        (try
+          (repo/init! conn)
+          (let [payload (utf8 "original bytes") oid (object/object-id :blob payload)
+                graph (graph-for-root (raw-leaf-tree name-bytes oid) {oid {:type :blob :payload payload}})]
+            (store/persist-graph! conn graph)
+            (let [failure (try (checkout/materialize! conn (:oid graph)) nil (catch Exception error error))]
+              (is (= ::checkout/unsupported-entry-name (:type (ex-data failure))))
+              (is (empty? (repo/files conn)))
+              (is (nil? (repo/head-commit conn)))))
+          (finally (d/release conn) (d/delete-database cfg)))))))
+
+(deftest supported-git-component-spelling-is-preserved
+  (doseq [name ["研究.md" " readable .md " "replacement-�.md"]]
+    (let [cfg (config)]
+      (d/create-database cfg)
+      (let [conn (d/connect cfg)]
+        (try
+          (repo/init! conn)
+          (let [payload (utf8 "faithful") oid (object/object-id :blob payload)
+                graph (graph-for-root (object/tree-payload [{:mode "100644" :name name :oid oid}])
+                                      {oid {:type :blob :payload payload}})]
+            (store/persist-graph! conn graph)
+            (checkout/materialize! conn (:oid graph))
+            (is (= [name] (repo/files conn)))
+            (is (= "faithful" (String. ^bytes (repo/read conn name) "UTF-8"))))
+          (finally (d/release conn) (d/delete-database cfg)))))))
+
+(deftest literal-backslash-entry-cannot-overwrite-a-nested-file
+  (let [cfg (config)]
+    (d/create-database cfg)
+    (let [conn (d/connect cfg)]
+      (try
+        (repo/init! conn)
+        (let [literal (utf8 "literal filename") nested (utf8 "nested filename")
+              literal-oid (object/object-id :blob literal) nested-oid (object/object-id :blob nested)
+              subtree (object/tree-payload [{:mode "100644" :name "b" :oid nested-oid}])
+              subtree-oid (object/object-id :tree subtree)
+              root (object/tree-payload [{:mode "40000" :name "a" :oid subtree-oid}
+                                         {:mode "100644" :name (str "a" (char 92) "b") :oid literal-oid}])
+              graph (graph-for-root root {literal-oid {:type :blob :payload literal}
+                                          nested-oid {:type :blob :payload nested}
+                                          subtree-oid {:type :tree :payload subtree}})]
+          (store/persist-graph! conn graph)
+          (let [failure (try (checkout/materialize! conn (:oid graph)) nil (catch Exception error error))]
+            (is (= ::checkout/unsupported-entry-name (:type (ex-data failure))))
+            ;; Private streamed preparation may contain earlier valid entries;
+            ;; none may be overwritten by a normalized alias or published tip.
+            (when-let [actual (repo/read conn "a/b")]
+              (is (= "nested filename" (String. ^bytes actual "UTF-8"))))
+            (is (nil? (repo/head-commit conn)))))
+        (finally (d/release conn) (d/delete-database cfg))))))
+
 (deftest imported-history-materializes-only-selected-snapshot
   (let [source-cfg (config)
         target-cfg (config)]
