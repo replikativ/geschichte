@@ -76,9 +76,10 @@
 
 (defn fetch!
   "Fetch all branch/tag tips over stateful upload-pack. `argv-fn` may launch SSH
-  or a local Git service and is invoked once per protocol-v2 command."
+  or a local Git service and is invoked once per protocol-v2 command. Optional
+  :haves names commit OIDs with a complete locally held reachable object graph."
   ([conn remote argv-fn] (fetch! conn remote argv-fn nil))
-  ([conn remote argv-fn {:keys [prefixes]
+  ([conn remote argv-fn {:keys [prefixes haves]
                          :or {prefixes ["HEAD" "refs/heads/" "refs/tags/"]}
                          :as opts}]
    (let [probe (session! argv-fn "git-upload-pack"
@@ -94,7 +95,7 @@
        (do (store/record-refs! conn remote refs)
            {:refs refs :objects 0 :persisted 0 :unborn? true})
        (let [request (protocol/fetch-request
-                      {:capabilities request-capabilities :wants wants})
+                      {:capabilities request-capabilities :wants wants :haves haves})
              fetch-session
              (session-consume-with!
               argv-fn "git-upload-pack" (constantly request)
@@ -104,7 +105,7 @@
 
 (defn ls-remote!
   "Discover refs over SSH/local upload-pack without persisting or fetching."
-  [argv-fn {:keys [prefixes]
+  [argv-fn {:keys [prefixes haves]
             :or {prefixes ["HEAD" "refs/heads/" "refs/tags/"]}}]
   (let [probe (session! argv-fn "git-upload-pack"
                         (protocol/ls-refs-request {:prefixes prefixes}))]

@@ -15,7 +15,7 @@ tests.
 | Stage/commit | `add`, `commit`, `rm`, `mv`, `restore`, `reset`, `clean` | three-tree local workflow, ignores/force-add, tracked `commit -a/-am`, path restore/reset, safe clean force policy |
 | Refs | `branch`, `switch`, `checkout`, `tag`, `merge` | branch start points, lightweight tags, fast-forward and clean two-parent merges; conflicts are reported without unsafe partial mutation |
 | Configuration | `config`, `remote` | local values/remotes persist in Datahike; host-global values are layered above them |
-| Network | `fetch`, `pull`, `push` | one named remote, all advertised refs, fast-forward-only pull, one branch refspec; transport I/O is injected by the host |
+| Network | `fetch`, `pull`, `push` | one named remote, all advertised refs, fast-forward-only pull, one branch refspec; successful remote clones retain origin/upstream; JVM fetch APIs accept explicit `:haves` for incremental transfer; transport I/O is injected by the host |
 | Workspaces | `worktree list/add/remove/prune` | physical JVM projections and Muschel mounts; named refs, `-b`/`-B`, conservative dirty removal, force removal, stale pruning, and multiple isolated checkouts of the same logical ref |
 
 Global `--no-pager`, `--paginate`, and repeated `-C` are parsed before repository

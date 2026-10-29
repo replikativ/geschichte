@@ -2,6 +2,8 @@
   (:require [clojure.test :refer [deftest is]]
             [datahike.api :as d]
             [geschichte.git.http :as http]
+            [geschichte.git.client :as client]
+            [geschichte.git.project :as project]
             [geschichte.git.object :as object]
             [geschichte.git.pack :as pack]
             [geschichte.git.pkt-line :as pkt]
@@ -88,3 +90,52 @@
            (http/ls-remote! send-fn "https://example.test/repo.git"
                             {:prefixes ["refs/heads/"]})))
     (is (= [:get :post] @calls))))
+
+(deftest incremental-fetch-transfers-only-the-new-objects
+  (let [configs (repeatedly 2 #(hash-map :store {:backend :memory :id (random-uuid)}
+                                         :schema-flexibility :write :keep-history? true
+                                         :commit-graph? true))]
+    (doseq [cfg configs] (d/create-database cfg))
+    (let [[source target :as conns] (mapv d/connect configs)]
+      (try
+        (doseq [conn conns] (repo/init! conn))
+        (repo/write! source "README.md" (object/utf8 "one\n"))
+        (repo/stage-all! source)
+        (let [base (repo/commit! source {:message "base"})
+              base-graph (project/project source (:geschichte.commit/id base))
+              base-oid (:oid base-graph)
+              refs (fn [oid] [{:ref "HEAD" :oid oid
+                               :attributes {:symref-target "refs/heads/main"}}])]
+          (client/ingest-fetch! target
+                                (pkt/encode ["packfile\n"
+                                             (object/concat-bytes (byte-array [1]) (pack/encode (:objects base-graph)))
+                                             :flush]))
+          (client/checkout-fetched! target {:refs (refs base-oid)})
+          (repo/write! source "notes.md" (object/utf8 "two\n"))
+          (repo/stage-all! source)
+          (let [next-commit (repo/commit! source {:message "next"})
+                graph (project/project source (:geschichte.commit/id next-commit))
+                oid (:oid graph)
+                new-objects (apply dissoc (:objects graph) (keys (:objects base-graph)))
+                calls (atom [])
+                send-fn (fn [{:keys [method body] :as request}]
+                          (swap! calls conj request)
+                          (if (= :get method)
+                            {:status 200 :body (pkt/encode ["version 2\n" "ls-refs\n" "fetch\n" :flush])}
+                            (if (= "command=ls-refs\n" (pkt/text (first (pkt/decode body))))
+                              {:status 200 :body (pkt/encode [(str oid " HEAD symref-target:refs/heads/main\n") :flush])}
+                              {:status 200 :body (pkt/encode ["packfile\n"
+                                                              (object/concat-bytes (byte-array [1]) (pack/encode new-objects))
+                                                              :flush])})))
+                result (http/fetch! send-fn target "origin" "https://example.test/repo.git"
+                                    {:haves [base-oid]})
+                request-lines (mapv #(if (bytes? %) (pkt/text %) %) (pkt/decode (:body (last @calls))))]
+            (is (some #{(str "have " base-oid "\n")} request-lines))
+            (is (= (count new-objects) (:persisted result)))
+            (is (< (count new-objects) (count (:objects graph))))
+            (is (= :fast-forward (:pull/status (client/apply-pull! target "origin" result))))
+            (is (= "one\n" (String. ^bytes (repo/read target "README.md") "UTF-8")))
+            (is (= "two\n" (String. ^bytes (repo/read target "notes.md") "UTF-8")))))
+        (finally
+          (doseq [conn conns] (d/release conn))
+          (doseq [cfg configs] (d/delete-database cfg)))))))

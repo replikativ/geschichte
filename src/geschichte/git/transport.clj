@@ -1,6 +1,8 @@
 (ns geschichte.git.transport
   "Default JVM Git remote transport selection for the standalone CLI."
   (:require [clojure.string :as str]
+            [datahike.api :as d]
+            [geschichte.repo :as repo]
             [geschichte.git.http :as http]
             [geschichte.git.ssh :as ssh])
   (:import [java.net URI]))
@@ -51,10 +53,37 @@
     (http/push! conn url commit-id options)
     (ssh/push! conn commit-id (ssh-argv-fn url) options)))
 
-(defn clone! [{:keys [conn remote url options]}]
-  (if (http? url)
-    (http/clone! conn remote url options)
-    (ssh/clone! conn remote (ssh-argv-fn url) options)))
+(defn clone!
+  "Clone into a caller-owned initialized repository and remember its origin.
+  Successful checkout also records the selected branch's upstream. With
+  :no-checkout?, only the remote is configured. Transport failure never records
+  a successful connection. The host owns authentication and repository lifetime."
+  [{:keys [conn remote url options]}]
+  (let [result (if (http? url)
+                 (http/clone! conn remote url options)
+                 (ssh/clone! conn remote (ssh-argv-fn url) options))
+        local-ref (repo/current-ref conn)
+        fetched-refs (get-in result [:fetched :refs])
+        source-ref (if-let [branch (:branch options)]
+                     (str "refs/heads/" branch)
+                     (some #(when (= "HEAD" (:ref %))
+                              (get-in % [:attributes :symref-target])) fetched-refs))
+        source-oid (some #(when (= source-ref (:ref %)) (:oid %)) fetched-refs)
+        branch (when (and (not (:no-checkout? options))
+                          (str/starts-with? (or local-ref "") "refs/heads/")
+                          (str/starts-with? (or source-ref "") "refs/heads/")
+                          source-oid (= source-oid (:git-oid result)))
+                 (subs local-ref (count "refs/heads/")))
+        config (cond-> {(str "remote." remote ".url") url
+                        (str "remote." remote ".fetch")
+                        (str "+refs/heads/*:refs/remotes/" remote "/*")}
+                 branch (assoc (str "branch." branch ".remote") remote
+                               (str "branch." branch ".merge")
+                               source-ref))]
+    (d/transact conn (mapv (fn [[key value]]
+                             {:geschichte.config/key key
+                              :geschichte.config/value value}) config))
+    result))
 
 (defn ls-remote! [{:keys [url options]}]
   (if (http? url)

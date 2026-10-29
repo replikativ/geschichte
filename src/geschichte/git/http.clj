@@ -136,9 +136,11 @@
 
 (defn fetch!
   "Discover refs, fetch all advertised branch tips, persist remote-tracking refs,
-  and import the returned pack."
+  and import the returned pack. Optional :haves supplies commit OIDs whose full
+  reachable object graph the caller already holds. It is not inferred from
+  advertised refs or a partially materialized history."
   ([conn remote url] (fetch! send-http conn remote url nil))
-  ([send-fn conn remote url {:keys [prefixes]
+  ([send-fn conn remote url {:keys [prefixes haves]
                              :or {prefixes ["HEAD" "refs/heads/" "refs/tags/"]}
                              :as opts}]
    (let [advertisement (advertise! send-fn url "git-upload-pack")
@@ -161,7 +163,7 @@
              (rpc-with-input!
               send-fn url "git-upload-pack"
               (protocol/fetch-request
-               {:capabilities request-capabilities :wants wants})
+               {:capabilities request-capabilities :wants wants :haves haves})
               #(client/ingest-fetch-stream!
                 conn % (assoc (or opts {}) :remote remote :refs refs)))]
          (assoc imported :refs refs :unborn? false))))))
