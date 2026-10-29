@@ -742,7 +742,8 @@
 
    `:soft` moves only the ref, `:mixed` also replaces the complete index, and
    `:hard` additionally replaces tracked worktree paths. Hard reset preserves
-   untracked paths that do not collide with the target tree."
+   untracked paths that do not collide with the target tree. Mixed and hard
+   reset cancel a pending merge; soft reset refuses while one is pending."
   ([conn commit] (reset! conn commit {}))
   ([conn commit {:keys [mode] :or {mode :mixed}}]
    (platform-async
@@ -754,6 +755,10 @@
                    :else nil)
           _ (when-not (:geschichte.commit/id commit)
               (throw (ex-info "Unknown reset commit" {:commit commit})))
+          second-parent (merge-parent conn)
+          _ (when (and second-parent (= :soft mode))
+              (throw (ex-info "Cannot do a soft reset while a merge is pending"
+                              {:type ::pending-merge-soft-reset})))
           tree (await (tree-at conn commit))
           current-ref-name (current-ref conn)
           current-tracked (set (keys (query/stage @conn)))
@@ -774,7 +779,10 @@
                     (concat
                      (retract-paths-tx @conn :geschichte.work/path tracked-paths)
                      (map (fn [[path entry]] (work-entry-tx path entry)) tree)))
-          tx-data (vec (concat [ref-tx] index-tx work-tx))]
+          cancel-merge (when second-parent
+                         [[:db/retract (:db/id (query/repository @conn))
+                           :geschichte.repo/merge-parent (:db/id second-parent)]])
+          tx-data (vec (concat [ref-tx] index-tx work-tx cancel-merge))]
       (await (transact-data conn tx-data))
       (:geschichte.commit/id commit)))))
 
@@ -845,7 +853,9 @@
      (assoc plan :prepared? true))))
 
 (defn checkout!
-  "Switch logical branches and materialize the selected committed tree."
+  "Switch logical branches and materialize the selected committed tree.
+   A successful checkout cancels any pending merge in the same transaction;
+   refused checkouts preserve it. Existing dirty-state checks still apply."
   ([conn name] (checkout! conn name {}))
   ([conn name {:keys [force?]}]
    (platform-async
@@ -855,6 +865,7 @@
           ref (or (ref-entity @conn name)
                   (throw (ex-info "Unknown ref" {:ref name})))
           current-status (await (status conn))
+          second-parent (merge-parent conn)
           commit (:geschichte.ref/target ref)
           tree (if commit
                  (stage-map (await (snapshot-db conn commit)))
@@ -881,7 +892,10 @@
                    (materialize-tx tree)
                    [{:geschichte.repo/id
                      (:geschichte.repo/id (query/repository @conn))
-                     :geschichte.repo/head name}]))]
+                     :geschichte.repo/head name}]
+                   (when second-parent
+                     [[:db/retract (:db/id (query/repository @conn))
+                       :geschichte.repo/merge-parent (:db/id second-parent)]])))]
         (await (transact-data conn tx-data))
         name)))))
 

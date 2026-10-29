@@ -196,6 +196,17 @@ no commit/ref datoms, but still validates the same basis and can carry a receipt
 Plans are not durable queued work or history-retention pins; do not persist one
 and assume its historical content survives future garbage collection.
 
+## Pending merge cancellation
+
+`repo/reset!` follows Git's pending-merge policy: `:soft` refuses without
+changing the workspace; `:mixed` clears merge intent and resets the index while
+preserving the worktree; `:hard` additionally resets the tracked worktree.
+A successful `repo/checkout!` clears merge intent in the same transaction as
+the checkout, including forced checkout of the current branch. Existing
+dirty-checkout restrictions remain; refused operations preserve the complete
+workspace and pending merge. Subsequent ordinary commits therefore use only
+their current HEAD as parent, rather than inheriting a cancelled merge parent.
+
 ## Async portability
 
 JVM calls return direct values. Effectful CLJS calls return partial-CPS awaitable
