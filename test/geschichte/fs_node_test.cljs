@@ -39,6 +39,22 @@
                  (is (true? (bridge/unwrap-result
                              (<! (take-cps
                                   (fs/delete! conn "src/lib/b.txt"))))))
+                 (is (nil? (fs/stat conn "src")) "Inferred directories disappear with the last file")
+                 (bridge/unwrap-result (<! (take-cps (repo/write! conn "p0" (bytes/utf8 "neighbor")))))
+                 (bridge/unwrap-result (<! (take-cps (repo/write! conn "p" (bytes/utf8 "parent")))))
+                 (let [before @conn
+                       error (try (bridge/unwrap-result
+                                   (<! (take-cps (fs/write! conn "p/child" (bytes/utf8 "invalid")))))
+                                  nil (catch :default error error))]
+                   (is (some? error))
+                   (is (= before @conn)))
+                 (bridge/unwrap-result (<! (take-cps (fs/mkdir! conn "empty"))))
+                 (let [before @conn
+                       error (try (bridge/unwrap-result
+                                   (<! (take-cps (repo/write! conn "empty" (bytes/utf8 "invalid")))))
+                                  nil (catch :default error error))]
+                   (is (some? error))
+                   (is (= before @conn)))
                  (d/release conn))
                (catch :default error
                  (is false (str "Node filesystem test failed: "

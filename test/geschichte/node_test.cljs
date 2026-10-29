@@ -14,6 +14,7 @@
             [geschichte.merge-core-test]
             [geschichte.query-node-test]
             [geschichte.repo-node-test]
+            [geschichte.tree-test]
             [geschichte.workspace-node-test]))
 
 (defmethod test/report [::test/default :end-run-tests] [summary]
@@ -38,4 +39,5 @@
                   'geschichte.merge-core-test
                   'geschichte.query-node-test
                   'geschichte.repo-node-test
+                  'geschichte.tree-test
                   'geschichte.workspace-node-test))

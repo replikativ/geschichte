@@ -14,6 +14,7 @@
             [geschichte.merge.text :as text]
             [geschichte.query :as query]
             [geschichte.schema :as schema]
+            [geschichte.tree :as path-tree]
             [is.simm.partial-cps.async :refer [await]]
             #?(:clj [clojure.java.io :as io]))
   #?(:cljs (:require-macros [geschichte.macros :refer [platform-async]]))
@@ -30,7 +31,7 @@
                                    (str/split path #"/+"))]
     (when (or (str/blank? path) (some #{".."} parts))
       (throw (ex-info "Invalid repository path" {:path path})))
-    (str/join "/" parts)))
+    (path-tree/assert-path! (str/join "/" parts))))
 
 (defn- transact-data [conn tx-data]
   (execution/io-result #?(:clj (d/transact conn tx-data)
@@ -110,6 +111,44 @@
                               [:geschichte.content/id]}]) .
          :in $ ?path
          :where [?entry :geschichte.work/path ?path]] db path))
+
+(defn- explicit-directories [db]
+  (when (contains? (d/schema db) :geschichte.work-dir/path)
+    (d/q '[:find [?path ...] :where [_ :geschichte.work-dir/path ?path]] db)))
+
+(defn validate-worktree!
+  "Validate a proposed complete worktree against explicit directory metadata.
+   Read-only validation; ordinary bulk mutations require exclusive ownership."
+  [db tree]
+  (path-tree/assert-valid! tree (explicit-directories db)))
+
+(defn- descendant [db attr path]
+  (when (contains? (d/schema db) attr)
+    (let [prefix (str path "/")]
+      (some (fn [datom] (when (str/starts-with? (:v datom) prefix) (:v datom)))
+            (d/index-range db {:attrid attr :start prefix :end (str path "0")})))))
+
+(defn- validate-write-path! [db path]
+  (path-tree/assert-path! path)
+  (when-let [ancestor (some #(when (work-row db %) %) (path-tree/parent-paths path))]
+    (throw (ex-info "A parent path is a repository file"
+                    {:type ::path-tree/path-conflict :path ancestor :descendant path})))
+  (when-let [child (descendant db :geschichte.work/path path)]
+    (throw (ex-info "Cannot replace a repository directory with a file"
+                    {:type ::path-tree/path-conflict :path path :descendant child})))
+  (when-let [directory (or (when (and (contains? (d/schema db) :geschichte.work-dir/path)
+                                      (d/q '[:find ?e . :in $ ?path
+                                             :where [?e :geschichte.work-dir/path ?path]] db path)) path)
+                           (descendant db :geschichte.work-dir/path path))]
+    (throw (ex-info "A repository file conflicts with an explicit directory"
+                    {:type ::path-tree/path-conflict :path path :directory directory}))))
+
+(defn- write-work-tx [db path id size mode]
+  (validate-write-path! db path)
+  [{:geschichte.work/path path
+    :geschichte.work/content [:geschichte.content/id id]
+    :geschichte.work/size size
+    :geschichte.work/mode mode}])
 
 (defn- stage-row [db path]
   (d/q '[:find (pull ?entry [:db/id :geschichte.stage/path
@@ -275,6 +314,7 @@
   ([conn path value {:keys [mode] :or {mode default-mode} :as opts}]
    (platform-async
     (let [path (normalize-path path)
+          _ (validate-write-path! @conn path)
           size (bytes/length value)
           base-id (get-in (work-row @conn path)
                           [:geschichte.work/content :geschichte.content/id])
@@ -283,10 +323,7 @@
            (content/transact-content!
             conn value base-id
             (fn [id]
-              [{:geschichte.work/path path
-                :geschichte.work/content [:geschichte.content/id id]
-                :geschichte.work/size (long size)
-                :geschichte.work/mode (long mode)}])
+              [[:db.fn/call write-work-tx path id (long size) (long mode)]])
             opts))]
       {:path path :content content-id :size size :mode mode}))))
 
@@ -296,6 +333,7 @@
      ([conn path file] (write-file! conn path file {}))
      ([conn path file {:keys [mode] :or {mode default-mode} :as opts}]
       (let [path (normalize-path path)
+            _ (validate-write-path! @conn path)
             file (io/file file)
             size (.length ^java.io.File file)
             base-id (get-in (work-row @conn path)
@@ -304,10 +342,7 @@
             (content/transact-file!
              conn file base-id
              (fn [id]
-               [{:geschichte.work/path path
-                 :geschichte.work/content [:geschichte.content/id id]
-                 :geschichte.work/size (long size)
-                 :geschichte.work/mode (long mode)}])
+               [[:db.fn/call write-work-tx path id (long size) (long mode)]])
              opts)]
         {:path path :content content-id :size size :mode mode}))))
 
@@ -432,6 +467,7 @@
                              {:type ::amend-during-merge})))
          head-tree (await (head-map conn))
          index (stage-map @conn)]
+     (path-tree/assert-valid! index)
      (when (and (= head-tree index) (nil? second-parent) (not amend?))
        (throw (ex-info "Nothing staged to commit"
                        {:status (await (status conn))})))
@@ -499,6 +535,7 @@
        (throw (ex-info "Prepared commits do not support pending merges"
                        {:type ::invalid-preparation})))
      (let [index (stage-map db)
+           _ (path-tree/assert-valid! index)
            head-tree (if head (stage-map (await (snapshot-db db head))) {})
            noop? (= index head-tree)
            commit (when-not noop?
@@ -542,6 +579,7 @@
     (throw (ex-info "Prepared publication basis is stale or invalid"
                     {:type ::stale-preparation :repository repository :ref ref
                      :checkpoint checkpoint})))
+  (path-tree/assert-valid! index)
   (if (:noop? plan)
     []
     [commit {:geschichte.ref/name ref
@@ -631,6 +669,7 @@
              db attr (vec paths))))
 
 (defn- materialize-tx [tree]
+  (path-tree/assert-valid! tree)
   (vec
    (mapcat
     (fn [[path {:keys [content size mode]}]]
@@ -677,6 +716,11 @@
     (let [paths (mapv normalize-path paths)
           source (or source (if staged? :head :index))
           tree (await (tree conn source))
+          db @conn
+          replace-selected (fn [target]
+                             (merge (apply dissoc target paths) (select-keys tree paths)))
+          _ (when worktree? (validate-worktree! db (replace-selected (query/worktree db))))
+          _ (when staged? (path-tree/assert-valid! (replace-selected (stage-map db))))
           tx-data
           (vec
            (mapcat
@@ -715,6 +759,10 @@
           current-tracked (set (keys (query/stage @conn)))
           target-paths (set (keys tree))
           tracked-paths (set/union current-tracked target-paths)
+          _ (path-tree/assert-valid! tree)
+          _ (when (= :hard mode)
+              (validate-worktree! @conn
+                                  (merge (apply dissoc (query/worktree @conn) tracked-paths) tree)))
           ref-tx {:geschichte.ref/name current-ref-name
                   :geschichte.ref/target
                   [:geschichte.commit/id (:geschichte.commit/id commit)]}
@@ -738,6 +786,8 @@
   ([conn file-map] (materialize-bytes! conn file-map nil))
   ([conn file-map {:keys [force?]}]
    (platform-async
+    (when (map? file-map)
+      (validate-worktree! @conn (into {} (map (fn [[path entry]] [(normalize-path path) entry])) file-map)))
     (let [current-status (await (status conn))]
       (when (and (not force?) (not (:clean? current-status)))
         (throw (ex-info "Materialization would overwrite local changes"
@@ -758,11 +808,7 @@
                      :base-id nil
                      :tx-fn
                      (fn [id]
-                       [{:geschichte.work/path path
-                         :geschichte.work/content
-                         [:geschichte.content/id id]
-                         :geschichte.work/size (long (bytes/length bytes))
-                         :geschichte.work/mode (long mode)}])}))
+                       [[:db.fn/call write-work-tx path id (long (bytes/length bytes)) (long mode)]])}))
                 batch)))
        :cljs
        (doseq [[path {:keys [bytes mode]}] file-map]
@@ -774,6 +820,7 @@
   "Install a clean merge plan and remember its second logical parent."
   [conn {:keys [ours theirs tree conflicts clean?] :as plan}]
   (platform-async
+   (validate-worktree! @conn tree)
    (when-not clean?
      (throw (ex-info "Cannot apply a merge plan with unresolved conflicts"
                      {:conflicts conflicts})))
@@ -824,6 +871,8 @@
                          :conflicting-untracked conflicting-untracked})))
       (let [tracked-paths (set/union (set (keys (query/stage @conn)))
                                      (set (keys tree)))
+            _ (validate-worktree! @conn
+                                  (merge (apply dissoc (query/worktree @conn) tracked-paths) tree))
             tx-data
             (into (into (retract-paths-tx @conn :geschichte.work/path
                                           tracked-paths)

@@ -5,6 +5,7 @@
             [datahike.api :as d]
             [geschichte.async :as execution]
             [geschichte.repo :as repo]
+            [geschichte.tree :as path-tree]
             [is.simm.partial-cps.async :refer [await]])
   #?(:cljs (:require-macros [geschichte.macros :refer [platform-async]]))
   #?(:clj (:require [geschichte.macros :refer [platform-async]])))
@@ -32,9 +33,10 @@
     (map #(str/join "/" (take % parts)) (range 1 (count parts)))))
 
 (defn directories [conn]
-  (into (sorted-set "")
-        (concat (explicit-dirs @conn)
-                (mapcat path-prefixes (repo/files conn)))))
+  (let [explicit (explicit-dirs @conn)]
+    (into (sorted-set "")
+          (concat explicit
+                  (mapcat path-prefixes (concat (repo/files conn) explicit))))))
 
 (defn stat [conn path]
   (let [path (normalize path)]
@@ -81,6 +83,7 @@
    (let [path (normalize path)]
      (when (str/blank? path)
        (throw (ex-info "Geschichte root already exists" {})))
+     (path-tree/assert-path! path)
      (when (stat conn path)
        (throw (ex-info "Geschichte path already exists" {:path path})))
      (when-not (= :dir (:type (stat conn (parent path))))
@@ -89,10 +92,11 @@
      path)))
 
 (defn- ensure-parents! [conn path]
-  (platform-async
-   (doseq [dir (path-prefixes path)]
-     (when-not (stat conn dir)
-       (await (transact-data conn [{:geschichte.work-dir/path dir}]))))))
+  ;; Parents are derived from file paths. Only mkdir! creates persistent empty
+  ;; directory records; writing a file must not manufacture those records.
+  (doseq [dir (path-prefixes path)]
+    (when (= :file (:type (stat conn dir)))
+      (throw (ex-info "Parent path is not a directory" {:path path :parent dir})))))
 
 (defn write!
   ([conn path value] (write! conn path value nil))
@@ -103,7 +107,7 @@
         (throw (ex-info "Cannot write the Geschichte root" {})))
       (when (= :dir (:type (stat conn path)))
         (throw (ex-info "Cannot replace directory with file" {:path path})))
-      (await (ensure-parents! conn path))
+      (ensure-parents! conn path)
       (await (repo/write! conn path value (or opts {})))))))
 
 (defn delete! [conn path]
@@ -134,6 +138,8 @@
          entry (stat conn from)]
      (when (or (str/blank? from) (str/blank? to))
        (throw (ex-info "Cannot rename Geschichte root" {:from from :to to})))
+     (path-tree/assert-path! from)
+     (path-tree/assert-path! to)
      (when-not entry
        (throw (ex-info "Source path does not exist" {:from from})))
      (when (stat conn to)

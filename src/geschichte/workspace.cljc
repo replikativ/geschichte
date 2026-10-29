@@ -18,6 +18,7 @@
             [geschichte.merge.core :as graph]
             [geschichte.query :as query]
             [geschichte.repo :as repo]
+            [geschichte.tree :as path-tree]
             [is.simm.partial-cps.async :refer [await]])
   #?(:cljs (:require-macros [geschichte.macros :refer [platform-async]]))
   #?(:clj (:require [geschichte.macros :refer [platform-async]])))
@@ -400,6 +401,7 @@
                        [:db.fn/call update-publication-ref-tx ref ref-entity canonical-ref tip])
           workspace-head (d/commit-id @workspace)
           tx-data (conj (:tx-data transfer) ref-update)]
+      (path-tree/assert-valid! tree)
       (await (merge-data canonical #{workspace-head} tx-data))
       {:ref ref
        :old canonical-ref
@@ -506,6 +508,8 @@
                       [:geschichte.commit/id tip]]
           tracked-paths (set/union (set (keys (query/stage target-db)))
                                    (set (keys tree)))
+          _ (repo/validate-worktree! target-db
+                                     (merge (apply dissoc (query/worktree target-db) tracked-paths) tree))
           tx-data (vec
                    (concat (:tx-data transfer)
                            (retract-paths target-db :geschichte.work/path

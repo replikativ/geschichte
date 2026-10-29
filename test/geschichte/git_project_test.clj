@@ -7,6 +7,30 @@
             [geschichte.git.store :as git-store]
             [geschichte.repo :as repo]))
 
+(deftest malformed-retained-tree-cannot-silently-lose-files-during-export
+  (let [cfg {:store {:backend :memory :id (random-uuid)}
+             :schema-flexibility :write :keep-history? true :commit-graph? true}]
+    (d/create-database cfg)
+    (let [conn (d/connect cfg)]
+      (try
+        (repo/init! conn)
+        (let [{:keys [content size mode]} (repo/write! conn "a" (object/utf8 "bytes"))]
+          (repo/stage-all! conn)
+          ;; Simulate retained history from an older writer that allowed this
+          ;; invalid tree. New public writes/commits reject it earlier.
+          (d/transact conn [{:geschichte.stage/path "a/b" :geschichte.stage/state :present
+                             :geschichte.stage/content [:geschichte.content/id content]
+                             :geschichte.stage/size (long size) :geschichte.stage/mode (long mode)}])
+          (let [id (random-uuid) snapshot (d/commit-id @conn)]
+            (d/transact conn [{:geschichte.commit/id id :geschichte.commit/snapshot snapshot
+                               :geschichte.commit/message "retained invalid tree"
+                               :geschichte.commit/author "fixture" :geschichte.commit/time (java.util.Date.)}])
+            (let [before @conn
+                  failure (try (project/project conn id) nil (catch Exception error error))]
+              (is (= :geschichte.tree/path-conflict (:type (ex-data failure))))
+              (is (= before @conn)))))
+        (finally (d/release conn) (d/delete-database cfg))))))
+
 (deftest snapshots-project-to-a-complete-git-graph
   (let [cfg {:store {:backend :memory :id (random-uuid)}
              :schema-flexibility :write :keep-history? true :commit-graph? true}]

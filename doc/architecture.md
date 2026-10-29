@@ -63,6 +63,21 @@ filesystem protocol. Directory nodes are workspace state: parent directories are
 derived from file paths and explicit empty directories live in Datahike, but only
 files enter Geschichte/Git commits.
 
+File paths are normalized, nonempty paths; a file may not be another file's
+ancestor. Explicit empty directories may not coincide with a file or lie beneath
+one. File writes check this invariant again inside their publication transaction,
+using indexed path lookups. Merge planning reports file/directory overlaps as
+structural conflicts rather than constructing a clean but unrepresentable tree.
+Bulk restoration and export validate their resulting file trees before use.
+
+`fs/write!` derives parent directories from its file path. Only `fs/mkdir!` creates
+persistent empty-directory records. After the last file under an inferred parent
+is removed, that parent disappears; an explicitly created directory remains.
+Older repositories may contain parent-directory records written automatically by
+previous versions. They are preserved conservatively: remove conflicting empty
+directories explicitly before replacing them with files. No metadata migration
+guesses whether such a directory was user-authored.
+
 ```text
 agent shell / SCI loader
           |
@@ -95,6 +110,22 @@ and dvergr routes shell builtins, SCI loading and file I/O, structured tools,
 skills, and app serving through that root. The Yggdrasil adapter advertises
 snapshot, branch, graph, merge, and commit capabilities without inventing a fake
 physical path. External native processes remain an explicit projection boundary.
+
+## Mutation ownership
+
+| Operation | Required ownership and guarantee |
+| --- | --- |
+| Pure DB queries / historical commit reads | Read immutable snapshots; retain the required history and payload lifetime. |
+| Ordinary staging, commit, filesystem rename/mkdir/delete, restore/reset/checkout | Caller serializes mutation of that workspace. Multi-step APIs do not promise a coherent result against concurrent writers. |
+| Individual file writes | Publication preserves file-tree structure inside the writer transaction; this is not a content-revision compare-and-swap. |
+| Prepared commits / workspace advance | Preparation captures snapshots; serialized publication validates the destination basis and refuses stale work. |
+| Workspace publication | Serialized destination ref/absence checks; callers retain source history and own source preparation. |
+| Git clone / streamed materialization | Exclusively owned private preparation. Later input or IO failure may leave partial private state; do not expose it or retry publication as if preparation succeeded. |
+
+Force options relax the documented dirty-state policy, never the file-tree
+invariant. Map materialization can prevalidate all path keys before clearing a
+worktree. Streamed materialization validates each bounded batch without retaining
+all payloads; it retains its existing partial-failure contract.
 
 ## CLJ/CLJS boundary
 
