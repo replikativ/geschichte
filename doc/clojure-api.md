@@ -233,8 +233,19 @@ dirty-checkout restrictions remain; refused operations preserve the complete
 workspace and pending merge. Subsequent ordinary commits therefore use only
 their current HEAD as parent, rather than inheriting a cancelled merge parent.
 
+## Bounded JVM merge planning
+
+`geschichte.merge/plan` accepts `:merge-budget`, a shared operation created by
+`geschichte.budget/create`. Start with `merge/recommended-budget-policy` and
+verify `merge/budget-profile` when selecting a runtime dynamically. All required
+finite dimensions and a positive deadline must be present before source access.
+The planner leaves refs, index and worktree unchanged, but its content resolver
+may store immutable merged content in the caller-owned private connection.
+See [the resource and publication contract](bounded-merge.md) for exact units,
+partial preparation, cancellation and the initial Node stream limitation.
+
 ## Async portability
 
 JVM calls return direct values. Effectful CLJS calls return partial-CPS awaitable
-values where Datahike/Konserve are asynchronous; pure query, diff, merge-planning,
+values where Datahike/Konserve are asynchronous; pure query, diff, portable tree-merge planning,
 Git object, and protocol operations remain synchronous.

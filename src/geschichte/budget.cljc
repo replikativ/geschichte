@@ -5,10 +5,15 @@
 
 (def ^:private cumulative
   #{:response-bytes :pack-bytes :objects :inflated-bytes :reconstructed-bytes
-    :commit-visits :tree-entries :checkout-files :checkout-bytes})
+    :commit-visits :tree-entries :checkout-files :checkout-bytes
+    :graph-edges :tree-path-bytes :tree-bytes :result-tree-bytes :content-visits :content-parts
+    :content-read-bytes :content-decoded-bytes :text-lines :text-work
+    :text-trace-cells :delta-forms :merge-output-bytes})
 
 (def ^:private bounds
-  #{:object-bytes :delta-result-bytes :delta-depth :tree-depth :index-bytes})
+  #{:object-bytes :delta-result-bytes :delta-depth :tree-depth :index-bytes
+    :path-bytes :content-depth :delta-edn-depth :delta-token-chars
+    :text-frontier-cells})
 
 (def ^:private maximum-integer #?(:clj Long/MAX_VALUE :cljs js/Number.MAX_SAFE_INTEGER))
 
@@ -68,6 +73,25 @@
       (refuse! budget "Operation deadline exceeded" {:type (kind budget "deadline-exceeded")})))
   nil)
 
+(defn unsupported!
+  "Terminal refusal when a backend lacks the ownership seam required for a
+  bounded operation. No fallback to unbounded access is permitted."
+  [operation capability]
+  (check! operation)
+  (refuse! operation "Backend does not support this bounded operation"
+           {:type (kind operation "unsupported") :capability capability}))
+
+(defn exceed!
+  "Terminal refusal at a native algorithm's fixed capacity, even when the
+  caller's policy allows more. Does not silently change the chosen algorithm."
+  [operation metric limit requested]
+  (when operation
+    (check! operation)
+    (refuse! operation "Operation exceeds native algorithm capacity"
+             {:type (kind operation "exceeded") :metric metric
+              :limit (amount! operation limit) :requested (amount! operation requested)
+              :used (get @(:used operation) metric 0)})))
+
 (defn remaining-ms [budget]
   (check! budget)
   (when-let [timeout (:timeout-ns budget)]
@@ -108,6 +132,26 @@
 
 (defn snapshot [budget]
   (when budget {:limits (:limits budget) :used @(:used budget)}))
+
+(defn require-limits!
+  "Validate a complete finite policy for a newly bounded operation entry.
+  Does not create/reset a handle or access its caller's source. Existing optional
+  budget APIs do not call this and retain their partial-policy semantics."
+  [budget required]
+  (let [atom? #?(:clj (fn [value] (instance? clojure.lang.Atom value))
+                 :cljs (fn [value] (instance? cljs.core/Atom value)))
+        limits (:limits budget)
+        missing (vec (sort (filter #(not (and (map? limits) (contains? limits %)
+                                              (integer? (get limits %))
+                                              (<= 0 (get limits %) maximum-integer))) required)))]
+    (when-not (and (map? budget) (map? limits) (atom? (:used budget)) (atom? (:failure budget))
+                   (number? (:started budget))
+                   (integer? (:timeout-ns budget)) (pos? (:timeout-ns budget))
+                   (<= (:timeout-ns budget) maximum-integer) (empty? missing))
+      (throw (ex-info "Operation requires complete finite limits and a positive deadline"
+                      {:type (kind budget "invalid-policy") :missing-limits missing})))
+    (check! budget))
+  nil)
 
 (defn failure?
   "Recognize typed resource refusals, including the original Git API keywords."

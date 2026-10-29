@@ -10,6 +10,7 @@
             [datahike.api :as d]
             [geschichte.async :as execution]
             [geschichte.bytes :as bytes]
+            [geschichte.budget :as budget]
             [geschichte.content :as content]
             [geschichte.merge.text :as text]
             [geschichte.query :as query]
@@ -986,27 +987,30 @@
   JVM-shaped: it reads and writes synchronously, which is why it lives here
   rather than in the portable planner."
   ([conn] (content-merger conn nil))
-  ([conn {:keys [max-bytes] :or {max-bytes (* 1 1024 1024)}}]
+  ([conn {:keys [max-bytes merge-budget read-db] :or {max-bytes (* 1 1024 1024)}}]
    (fn [_path base ours theirs]
      (let [entries [base ours theirs]]
        (when (and (apply = (map :mode entries))
                   (every? #(<= (or (:size %) 0) max-bytes) entries))
          (let [texts (mapv (fn [{:keys [content]}]
                              (try
-                               (let [bs (content/read-by-id conn content)
+                               (let [bs (content/read-by-id conn content (when merge-budget {:merge-budget merge-budget :read-db read-db}))
                                      s (when bs (bytes/decode-utf8-strict bs))]
                                  (when (and s (not (str/includes? s "\u0000")))
                                    s))
-                               (catch #?(:clj Exception :cljs :default) _ nil)))
+                               (catch #?(:clj Exception :cljs :default) error
+                                 (if (budget/failure? error) (throw error) nil))))
                            entries)]
            (when (every? some? texts)
              (let [[b o t] texts
-                   {:keys [clean? text]} (text/merge-text b o t)]
+                   {:keys [clean? text]} (text/merge-text b o t {:merge-budget merge-budget})]
                (when clean?
                  (let [value (bytes/utf8 text)
                        ;; store the merged bytes and take their id; no metadata
                        ;; to transact, the tree entry below IS the reference
-                       id (content/transact-content! conn value nil (constantly []))]
+                       _ (budget/check! merge-budget)
+                       id (content/transact-content! conn value nil (constantly []))
+                       _ (budget/check! merge-budget)]
                    {:content id
                     ;; LONG, explicitly. `:geschichte.work/size` is
                     ;; `:db.type/long` and datahike checks the class, so an

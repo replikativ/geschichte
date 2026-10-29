@@ -40,3 +40,20 @@
   (is (nil? (budget/bound! nil :unknown -1)))
   (is (nil? (budget/remaining-ms nil)))
   (is (nil? (budget/snapshot nil))))
+
+(deftest strict-entry-requires-completeness-without-resetting-account
+  (let [complete {:limits {:objects 2} :timeout-ms 10000}
+        b (budget/create complete)]
+    (is (nil? (budget/require-limits! b [:objects])))
+    (budget/charge! b :objects 1)
+    (budget/require-limits! b [:objects])
+    (is (= 1 (get-in (budget/snapshot b) [:used :objects])))
+    (is (= ::budget/invalid-policy
+           (:type (refusal #(budget/require-limits! b [:objects :pack-bytes])))))
+    (is (= ::budget/invalid-policy
+           (:type (refusal #(budget/require-limits! (budget/create {:limits {:objects 1}}) [:objects]))))))
+  (let [b (budget/create {:limits {:objects 0} :timeout-ms 10000})]
+    (budget/require-limits! b [:objects])
+    (let [failure (refusal #(budget/charge! b :objects 1))]
+      (is (= ::budget/exceeded (:type failure)))
+      (is (= failure (refusal #(budget/require-limits! b [:objects])))))))

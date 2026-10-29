@@ -143,6 +143,7 @@ Deeper: [Architecture](doc/architecture.md) (the two branch systems),
 
 - [Getting started](doc/getting-started.md)
 - [Clojure API](doc/clojure-api.md)
+- [Bounded native merge planning](doc/bounded-merge.md)
 - [Querying the repository](doc/querying.md)
 - [ClojureScript](doc/clojurescript.md)
 - [CLI](doc/cli.md)
