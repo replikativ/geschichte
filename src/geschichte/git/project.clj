@@ -3,12 +3,16 @@
   (:require [clojure.string :as str]
             [geschichte.git.object :as object]
             [geschichte.git.store :as store]
-            [geschichte.repo :as repo]))
+            [geschichte.repo :as repo]
+            [geschichte.tree :as path-tree]))
 
 (defn- git-mode [mode]
   (Integer/toOctalString (int mode)))
 
 (defn- tree-trie [tree]
+  ;; Validate before reducing: assoc-in on overlapping file/directory paths
+  ;; would otherwise hide one side and silently omit it from the exported tree.
+  (path-tree/assert-valid! tree)
   (reduce-kv (fn [trie path metadata]
                (assoc-in trie (str/split path #"/") metadata))
              {} tree))

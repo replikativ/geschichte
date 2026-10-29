@@ -3,6 +3,8 @@
   (:require [clojure.test :refer [deftest is testing]]
             [datahike.api :as d]
             [geschichte.repo :as repo]
+            [geschichte.content :as content]
+            [geschichte.fs :as fs]
             [geschichte.workspace :as workspace]))
 
 (defn- ->bytes [s] (.getBytes ^String s "UTF-8"))
@@ -301,4 +303,86 @@
           (is (contains? (set (keys (repo/refs fork))) "refs/heads/logical"))
           (is (not (contains? (set (keys (repo/refs conn))) "refs/heads/logical")))
           (finally (d/release fork))))
+      (finally (cleanup f)))))
+
+(deftest writes-preserve-file-tree-structure
+  (let [{:keys [conn] :as f} (fixture)]
+    (try
+      (repo/init! conn)
+      (repo/write! conn "a0" (->bytes "adjacent range boundary"))
+      (repo/write! conn "a" (->bytes "parent file"))
+      (let [before @conn]
+        (is (thrown? Exception (repo/write! conn "a/child" (byte-array 0))))
+        (is (= before @conn)))
+      (repo/remove! conn "a")
+      (repo/write! conn "a/child" (byte-array 0))
+      (let [before @conn]
+        (is (thrown? Exception (repo/write! conn "a" (byte-array 0))))
+        (is (= before @conn)))
+      (fs/mkdir! conn "explicit")
+      (let [before @conn]
+        (is (thrown? Exception (repo/write! conn "explicit" (byte-array 0))))
+        (is (thrown? Exception (repo/write! conn "." (byte-array 0))))
+        (is (= before @conn)))
+      (finally (cleanup f)))))
+
+(deftest implicit-directory-file-transitions-remain-representable
+  (let [{:keys [conn] :as f} (fixture)]
+    (try
+      (repo/init! conn)
+      (fs/write! conn "a/b" (->bytes "child"))
+      (repo/stage-all! conn)
+      (repo/commit! conn {:message "directory"})
+      (repo/branch! conn "directory")
+      (fs/delete! conn "a/b")
+      (fs/write! conn "a" (->bytes "file"))
+      (repo/stage-all! conn)
+      (repo/commit! conn {:message "file"})
+      (repo/checkout! conn "directory")
+      (is (= ["a/b"] (repo/files conn)))
+      (repo/checkout! conn "main")
+      (is (= ["a"] (repo/files conn)))
+      (is (= "file" (text (repo/read conn "a"))))
+      (finally (cleanup f)))))
+
+(deftest concurrent-parent-write-invalidates-child-publication
+  (let [{:keys [conn] :as f} (fixture)
+        original content/transact-content!
+        injected? (atom false)
+        after-parent (atom nil)]
+    (try
+      (repo/init! conn)
+      (let [failure (with-redefs [content/transact-content!
+                                  (fn [c value base callback opts]
+                                    (when (compare-and-set! injected? false true)
+                                      (repo/write! conn "parent" (->bytes "winner"))
+                                      (reset! after-parent @conn))
+                                    (original c value base callback opts))]
+                      (try (repo/write! conn "parent/child" (->bytes "loser")) nil
+                           (catch Exception error error)))]
+        (is (= :geschichte.tree/path-conflict (:type (ex-data failure))))
+        (is (= @after-parent @conn))
+        (is (= ["parent"] (repo/files conn))))
+      (finally (cleanup f)))))
+
+(deftest bulk-restoration-refuses-prefix-collisions-before-mutation
+  (let [{:keys [conn] :as f} (fixture)]
+    (try
+      (repo/init! conn)
+      (repo/write! conn "parent" (->bytes "tracked"))
+      (repo/stage-all! conn)
+      (let [parent-commit (repo/commit! conn {:message "parent"})]
+        (repo/branch! conn "parent")
+        (repo/remove! conn "parent")
+        (repo/stage-all! conn)
+        (repo/commit! conn {:message "remove"})
+        (repo/write! conn "parent/child" (->bytes "untracked"))
+        (let [before @conn]
+          (doseq [operation [#(repo/restore-paths! conn ["parent"] {:source (:geschichte.commit/id parent-commit)})
+                             #(repo/reset! conn parent-commit {:mode :hard})
+                             #(repo/checkout! conn "parent" {:force? true})
+                             #(repo/materialize-bytes! conn {"a" {:bytes (byte-array 0)}
+                                                             "a/b" {:bytes (byte-array 0)}} {:force? true})]]
+            (is (thrown? Exception (operation)))
+            (is (= before @conn)))))
       (finally (cleanup f)))))

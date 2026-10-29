@@ -18,6 +18,7 @@
             [geschichte.merge.core :as graph]
             [geschichte.query :as query]
             [geschichte.repo :as repo]
+            [geschichte.tree :as path-tree]
             [is.simm.partial-cps.async :refer [await]])
   #?(:cljs (:require-macros [geschichte.macros :refer [platform-async]]))
   #?(:clj (:require [geschichte.macros :refer [platform-async]])))
@@ -367,6 +368,7 @@
               (throw (ex-info "Publication is not a fast-forward"
                               {:ref ref :expected canonical-ref :new tip})))
           tree (await (repo/tree-at workspace tip))
+          _ (path-tree/assert-valid! tree)
           transfer (transfer-data @workspace @canonical commits tip tree)
           ref-entity (d/q '[:find ?ref .
                             :in $ ?name
@@ -496,6 +498,8 @@
                       [:geschichte.commit/id tip]]
           tracked-paths (set/union (set (keys (query/stage target-db)))
                                    (set (keys tree)))
+          _ (repo/validate-worktree! target-db
+                                     (merge (apply dissoc (query/worktree target-db) tracked-paths) tree))
           tx-data (vec
                    (concat (:tx-data transfer)
                            (retract-paths target-db :geschichte.work/path

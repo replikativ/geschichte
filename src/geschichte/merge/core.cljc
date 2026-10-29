@@ -1,6 +1,7 @@
 (ns geschichte.merge.core
   "Pure, platform-neutral commit-graph and three-tree merge semantics."
-  (:require [clojure.set :as set]))
+  (:require [clojure.set :as set]
+            [geschichte.tree :as tree]))
 
 (def ^:private absent ::absent)
 
@@ -88,6 +89,7 @@
    (plan-trees base-id ours-id theirs-id base-tree ours-tree theirs-tree nil))
   ([base-id ours-id theirs-id base-tree ours-tree theirs-tree
     {:keys [resolve-content]}]
+   (doseq [input [base-tree ours-tree theirs-tree]] (tree/assert-valid! input))
    (let [paths (sort (set/union (set (keys base-tree))
                                 (set (keys ours-tree))
                                 (set (keys theirs-tree))))
@@ -107,7 +109,23 @@
                     (keep (fn [{:keys [path value conflict]}]
                             (when (and (nil? conflict) (not= value absent))
                               [path value])))
-                    resolutions)]
+                    resolutions)
+         structural (tree/prefix-conflicts (keys tree))
+         structural-index (reduce (fn [result [ancestor descendant]]
+                                    (-> result
+                                        (update ancestor (fnil into (sorted-set)) [ancestor descendant])
+                                        (update descendant (fnil into (sorted-set)) [ancestor descendant])))
+                                  {} structural)
+         structural-paths (set (keys structural-index))
+         conflicts (reduce (fn [result path]
+                             (assoc result path
+                                    {:kind :file-directory
+                                     :paths (vec (get structural-index path))
+                                     :base (get base-tree path absent)
+                                     :ours (get ours-tree path absent)
+                                     :theirs (get theirs-tree path absent)}))
+                           conflicts structural-paths)
+         tree (apply dissoc tree structural-paths)]
      {:kind (cond (= ours-id theirs-id) :up-to-date
                   (= base-id ours-id) :fast-forward
                   :else :merge)
@@ -117,5 +135,5 @@
      ;; message, or a reviewer, wants to know which files were reconciled
      ;; rather than taken wholesale from one side
       :merged (into (sorted-set) (keep (fn [{:keys [path merged?]}]
-                                         (when merged? path))
+                                         (when (and merged? (not (contains? structural-paths path))) path))
                                        resolutions))})))
