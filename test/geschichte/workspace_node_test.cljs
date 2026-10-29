@@ -21,6 +21,18 @@
                  (is (= ::workspace/invalid-checkpoint-mode (:type (ex-data failure))))))
              (finally (done))))))
 
+(deftest node-invalid-advance-options-refuse-before-source-access
+  (async done
+         (go
+           (try
+             (doseq [options [{:expected-checkpoint nil} {:expected-checkpoint "invalid"}
+                              {:expected-checkpont (random-uuid)}]]
+               (let [failure (try
+                               (bridge/unwrap-result (<! (take-cps (workspace/advance! nil nil options))))
+                               nil (catch :default error error))]
+                 (is (= ::workspace/invalid-advance-options (:type (ex-data failure))))))
+             (finally (done))))))
+
 (deftest node-workspace-fork-and-publish
   (async done
          (go
@@ -76,6 +88,20 @@
                                          (assoc cfg :branch :geschichte.workspace/node-observer)
                                          {:sync? false}))]
                        (try
+                         (let [expected (d/commit-id @observer)]
+                           (bridge/unwrap-result
+                            (<! (take-cps (repo/set-config! observer "example.setting" "changed"))))
+                           (let [before @observer
+                                 failure (try
+                                           (bridge/unwrap-result
+                                            (<! (take-cps
+                                                 (workspace/advance! canonical observer
+                                                                     {:expected-checkpoint expected}))))
+                                           nil
+                                           (catch :default error error))]
+                             (is (= ::workspace/stale-advance (:type (ex-data failure))))
+                             (is (= expected (:expected-checkpoint (ex-data failure))))
+                             (is (= before @observer))))
                          (let [merge-db! d/merge-db!
                                edited (atom nil)
                                failure
@@ -97,7 +123,8 @@
                            (bridge/unwrap-result
                             (<! (take-cps (repo/write! observer "base.txt" (bytes/utf8 "base\n"))))))
                          (let [advanced (bridge/unwrap-result
-                                         (<! (take-cps (workspace/advance! canonical observer))))
+                                         (<! (take-cps (workspace/advance! canonical observer
+                                                                           {:expected-checkpoint (d/commit-id @observer)}))))
                                observed (bridge/unwrap-result
                                          (<! (take-cps (repo/read observer "node.txt"))))]
                            (is (= (:geschichte.commit/id commit) (:new advanced)))
