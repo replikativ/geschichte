@@ -332,12 +332,26 @@
   (io-result #?(:clj (d/merge-db conn parents tx-data)
                 :cljs (d/merge-db! conn parents tx-data))))
 
+(defn- create-publication-ref-tx [db ref tip]
+  (when (d/q '[:find ?e . :in $ ?name :where [?e :geschichte.ref/name ?name]] db ref)
+    (throw (ex-info "Publication ref was created while preparing publication"
+                    {:type ::publication-ref-exists :ref ref})))
+  [{:geschichte.ref/name ref :geschichte.ref/target [:geschichte.commit/id tip]}])
+
+(defn- update-publication-ref-tx [db ref eid old tip]
+  (when-not (= eid (d/q '[:find ?e . :in $ ?name :where [?e :geschichte.ref/name ?name]] db ref))
+    (throw (ex-info "Publication ref identity changed while preparing publication"
+                    {:type ::stale-publication-ref :ref ref})))
+  [[:db.fn/cas eid :geschichte.ref/target
+    (when old [:geschichte.commit/id old]) [:geschichte.commit/id tip]]])
+
 (defn publish!
   "Publish one logical workspace ref into a canonical Geschichte connection.
 
   The update is a fast-forward by default. `:db.fn/cas` checks the canonical
-  ref again inside the serialized Datahike merge transaction, so concurrent
-  publishers cannot silently overwrite each other. `:force? true` permits a
+  ref again inside the serialized Datahike merge transaction, and newly created
+  refs validate absence there, so concurrent publishers cannot silently
+  overwrite each other. `:force? true` permits a
   deliberate non-fast-forward update.
 
   Only reachable immutable commit metadata and the selected ref are copied to
@@ -350,7 +364,8 @@
                          :or {force? false create? false}}]
    (platform-async
     (let [ref (normalize-ref (or ref (repo/current-ref workspace)))
-          canonical-ref (get (repo/refs canonical) ref ::missing)
+          canonical-db @canonical
+          canonical-ref (get (query/refs canonical-db) ref ::missing)
           _ (when (and (= ::missing canonical-ref) (not create?))
               (throw (ex-info "Canonical ref does not exist"
                               {:ref ref})))
@@ -367,27 +382,22 @@
               (throw (ex-info "Publication is not a fast-forward"
                               {:ref ref :expected canonical-ref :new tip})))
           tree (await (repo/tree-at workspace tip))
-          transfer (transfer-data @workspace @canonical commits tip tree)
+          transfer (transfer-data @workspace canonical-db commits tip tree)
           ref-entity (d/q '[:find ?ref .
                             :in $ ?name
                             :where [?ref :geschichte.ref/name ?name]]
-                          @canonical ref)
+                          canonical-db ref)
           ref-update (cond
-                       (nil? ref-entity)
+                       force?
                        {:geschichte.ref/name ref
                         :geschichte.ref/target
                         [:geschichte.commit/id tip]}
 
-                       force?
-                       {:db/id ref-entity
-                        :geschichte.ref/target
-                        [:geschichte.commit/id tip]}
+                       (nil? ref-entity)
+                       [:db.fn/call create-publication-ref-tx ref tip]
 
                        :else
-                       [:db.fn/cas ref-entity :geschichte.ref/target
-                        (when canonical-ref
-                          [:geschichte.commit/id canonical-ref])
-                        [:geschichte.commit/id tip]])
+                       [:db.fn/call update-publication-ref-tx ref ref-entity canonical-ref tip])
           workspace-head (d/commit-id @workspace)
           tx-data (conj (:tx-data transfer) ref-update)]
       (await (merge-data canonical #{workspace-head} tx-data))

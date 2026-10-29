@@ -102,6 +102,55 @@
                                          (<! (take-cps (repo/read observer "node.txt"))))]
                            (is (= (:geschichte.commit/id commit) (:new advanced)))
                            (is (= "node\n" (bytes/decode-utf8 observed))))
+                         (bridge/unwrap-result
+                          (<! (take-cps (repo/write! worker "next.txt" (bytes/utf8 "next\n")))))
+                         (bridge/unwrap-result (<! (take-cps (repo/stage-all! worker))))
+                         (let [next (bridge/unwrap-result
+                                     (<! (take-cps (repo/commit! worker {:message "next"}))))
+                               merge-db! d/merge-db!
+                               injected? (atom false)
+                               after-winner (atom nil)
+                               failure
+                               (with-redefs [d/merge-db!
+                                             (fn [conn parents tx]
+                                               (go
+                                                 (when (compare-and-set! injected? false true)
+                                                   (bridge/unwrap-result
+                                                    (<! (take-cps
+                                                         (workspace/publish! canonical worker
+                                                                             {:ref "topic" :create? true
+                                                                              :commit (:geschichte.commit/id next)}))))
+                                                   (reset! after-winner @canonical))
+                                                 (<! (merge-db! conn parents tx))))]
+                                 (try
+                                   (bridge/unwrap-result
+                                    (<! (take-cps
+                                         (workspace/publish! canonical observer
+                                                             {:ref "topic" :create? true
+                                                              :commit (:geschichte.commit/id commit)}))))
+                                   nil
+                                   (catch :default error error)))]
+                           (is (= ::workspace/publication-ref-exists (:type (ex-data failure))))
+                           (is (= (:geschichte.commit/id next) (get (repo/refs canonical) "refs/heads/topic")))
+                           (is (= @after-winner @canonical))
+                           (<! (d/transact! canonical [{:geschichte.ref/name "refs/heads/unborn"}]))
+                           (let [after-delete (atom nil)
+                                 failure
+                                 (with-redefs [d/merge-db!
+                                               (fn [conn parents tx]
+                                                 (go
+                                                   (bridge/unwrap-result
+                                                    (<! (take-cps (repo/delete-branch! canonical "unborn" {:force? true}))))
+                                                   (reset! after-delete @canonical)
+                                                   (<! (merge-db! conn parents tx))))]
+                                   (try
+                                     (bridge/unwrap-result
+                                      (<! (take-cps
+                                           (workspace/publish! canonical worker
+                                                               {:ref "unborn" :commit (:geschichte.commit/id next)}))))
+                                     nil (catch :default error error)))]
+                             (is (= ::workspace/stale-publication-ref (:type (ex-data failure))))
+                             (is (= @after-delete @canonical))))
                          (finally (d/release observer)))))
                    (d/release worker))
                  (d/release canonical))

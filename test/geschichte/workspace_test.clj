@@ -28,6 +28,117 @@
   (d/release canonical)
   (d/delete-database cfg))
 
+(deftest competing-ref-creation-preserves-the-winning-publication
+  (let [{:keys [cfg canonical] :as f} (fixture)]
+    (try
+      (workspace/fork! canonical "first")
+      (workspace/fork! canonical "second")
+      (let [a (d/connect (assoc cfg :branch :geschichte.workspace/first))
+            b (d/connect (assoc cfg :branch :geschichte.workspace/second))
+            merge-var (ns-resolve 'geschichte.workspace 'merge-data)
+            merge-data @merge-var
+            injected? (atom false)
+            winner (atom nil)
+            after-winner (atom nil)]
+        (try
+          (doseq [[conn file] [[a "a.txt"] [b "b.txt"]]]
+            (repo/write! conn file (->bytes file))
+            (repo/stage-all! conn)
+            (repo/commit! conn {:message file})
+            (repo/branch! conn "topic"))
+          (let [failure
+                (with-redefs-fn
+                  {merge-var (fn [conn parents tx]
+                               ;; The outer call has already observed absence.
+                               ;; Publish its competitor before it reaches the writer.
+                               (when (compare-and-set! injected? false true)
+                                 (reset! winner (workspace/publish! canonical b {:ref "topic" :create? true}))
+                                 (reset! after-winner @canonical))
+                               (merge-data conn parents tx))}
+                  #(try (workspace/publish! canonical a {:ref "topic" :create? true})
+                        nil (catch Exception error error)))]
+            (is (= ::workspace/publication-ref-exists (:type (ex-data failure))))
+            (is (nil? (:old @winner)))
+            (is (false? (:forced? @winner)))
+            (is (= (:new @winner) (get (repo/refs canonical) "refs/heads/topic")))
+            (is (= @after-winner @canonical) "Losing transfer and ref changes are rolled back"))
+          (finally (d/release a) (d/release b))))
+      (finally (cleanup f)))))
+
+(deftest publication-distinguishes-missing-and-unborn-refs
+  (let [{:keys [cfg canonical] :as f} (fixture)]
+    (try
+      (workspace/fork! canonical "publisher")
+      (let [worker (d/connect (assoc cfg :branch :geschichte.workspace/publisher))]
+        (try
+          (repo/branch! worker "topic")
+          (is (thrown? Exception (workspace/publish! canonical worker {:ref "topic"})))
+          (d/transact canonical [{:geschichte.ref/name "refs/heads/topic"}])
+          (let [result (workspace/publish! canonical worker {:ref "topic"})]
+            (is (nil? (:old result)))
+            (is (= (:new result) (get (repo/refs canonical) "refs/heads/topic"))))
+          (finally (d/release worker))))
+      (finally (cleanup f)))))
+
+(deftest ref-preparation-uses-one-canonical-snapshot
+  (doseq [interleaving [:delete-existing :delete-unborn :recreate-existing :rename-existing :create-unborn]]
+    (let [{:keys [cfg canonical] :as f} (fixture)]
+      (try
+        (workspace/fork! canonical "publisher")
+        (let [worker (d/connect (assoc cfg :branch :geschichte.workspace/publisher))
+              after-change (atom nil)
+              tree-at repo/tree-at]
+          (try
+            (repo/branch! worker "topic")
+            (when (#{:delete-existing :recreate-existing :rename-existing} interleaving)
+              (repo/branch! canonical "topic"))
+            (when (= :delete-unborn interleaving)
+              (d/transact canonical [{:geschichte.ref/name "refs/heads/topic"}]))
+            (let [failure
+                  (with-redefs [repo/tree-at
+                                (fn [conn commit]
+                                  (cond
+                                    (= :create-unborn interleaving)
+                                    (d/transact canonical [{:geschichte.ref/name "refs/heads/topic"}])
+
+                                    (= :rename-existing interleaving)
+                                    (let [eid (d/q '[:find ?e . :where [?e :geschichte.ref/name "refs/heads/topic"]] @canonical)]
+                                      (d/transact canonical [[:db/add eid :geschichte.ref/name "refs/heads/renamed"]]))
+
+                                    :else (do
+                                            (repo/delete-branch! canonical "topic" {:force? true})
+                                            (when (= :recreate-existing interleaving)
+                                              (repo/branch! canonical "topic"))))
+                                  (reset! after-change @canonical)
+                                  (tree-at conn commit))]
+                    (try (workspace/publish! canonical worker
+                                             {:ref "topic" :create? (= :create-unborn interleaving)})
+                         nil (catch Exception error error)))]
+              (is (= (if (= :create-unborn interleaving)
+                       ::workspace/publication-ref-exists ::workspace/stale-publication-ref)
+                     (:type (ex-data failure))))
+              (is (= @after-change @canonical) "Publication must preserve intervening ref lifecycle changes"))
+            (finally (d/release worker))))
+        (finally (cleanup f))))))
+
+(deftest explicit-force-publishes-to-the-current-logical-name
+  (let [{:keys [cfg canonical] :as f} (fixture)]
+    (try
+      (repo/branch! canonical "topic")
+      (workspace/fork! canonical "publisher")
+      (let [worker (d/connect (assoc cfg :branch :geschichte.workspace/publisher))
+            tree-at repo/tree-at]
+        (try
+          (let [result (with-redefs [repo/tree-at
+                                     (fn [conn commit]
+                                       (repo/delete-branch! canonical "topic" {:force? true})
+                                       (tree-at conn commit))]
+                         (workspace/publish! canonical worker {:ref "topic" :force? true}))]
+            (is (:forced? result))
+            (is (= (:new result) (get (repo/refs canonical) "refs/heads/topic"))))
+          (finally (d/release worker))))
+      (finally (cleanup f)))))
+
 (deftest isolated-workspaces-share-the-fork-snapshot
   (let [{:keys [cfg canonical] :as f} (fixture)]
     (try
