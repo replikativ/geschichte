@@ -45,6 +45,48 @@
     (object/concat-bytes
      body (.digest (MessageDigest/getInstance "SHA-1") body))))
 
+(deftest object-count-limit-applies-to-both-indexers
+  (let [payload (object/utf8 "hello\n")
+        encoded (pack/encode {(object/object-id :blob payload)
+                              {:type :blob :payload payload}})]
+    (doseq [threshold [0 Integer/MAX_VALUE]]
+      (let [failure (try (pack-read/scan (pack-source/byte-array-source encoded)
+                                         {:max-pack-objects 0 :primitive-index-threshold threshold})
+                         nil (catch Exception error error))]
+        (is (= "Git pack exceeds configured object limit" (ex-message failure)))
+        (is (= {:objects 1 :limit 0} (ex-data failure)))))))
+
+(deftest unsupported-unsigned-object-count-refuses-before-indexing
+  (let [body (object/concat-bytes (object/utf8 "PACK") (int32 2) (int32 -1))
+        encoded (object/concat-bytes body (.digest (MessageDigest/getInstance "SHA-1") body))]
+    (doseq [threshold [0 Integer/MAX_VALUE]]
+      (let [failure (try (pack-read/scan (pack-source/byte-array-source encoded)
+                                         {:primitive-index-threshold threshold})
+                         nil (catch Exception error error))]
+        (is (= "Git pack object count exceeds supported range" (ex-message failure)))
+        (is (= 4294967295 (:objects (ex-data failure))))))))
+
+(deftest inflated-size-overrun-refuses-before-reading-the-whole-stream
+  (let [payload (byte-array (* 512 1024))
+        _ (.nextBytes (java.util.Random. 42) payload)
+        compressed (deflate-bytes payload)
+        source (pack-source/byte-array-source compressed)
+        windows (atom 0)
+        tracked (reify pack-source/PackSource
+                  (source-size [_] (pack-source/source-size source))
+                  (read-range [_ offset length] (pack-source/read-range source offset length))
+                  (read-window [_ offset length]
+                    (swap! windows inc)
+                    (pack-source/read-window source offset length)))
+        inflate (ns-resolve 'geschichte.git.pack-read 'inflate-at)]
+    (doseq [retain? [false true]]
+      (reset! windows 0)
+      (let [failure (try (inflate tracked 0 (alength compressed) 1 retain? nil)
+                         nil (catch Exception error error))]
+        (is (= "Git pack object size mismatch" (ex-message failure)))
+        (is (= 1 (:declared (ex-data failure))))
+        (is (= 1 @windows) "Refuse the first oversized chunk, before retaining more output")))))
+
 (deftest writer-reader-roundtrip
   (let [payloads [(object/utf8 "hello\n")
                   (object/utf8 "a somewhat larger second blob\n")]
