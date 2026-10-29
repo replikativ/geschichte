@@ -29,3 +29,12 @@ capability Muschel fails closed instead of falling back to the daemon's cwd.
 Network Git is also host-injected. The standalone JVM CLI supplies HTTP/SSH
 transports; embedded sandboxes must provide a transport constrained by their
 domain, credential, and process policy.
+
+A remote-backed repository can carry ordinary SCI source, documents and workflow
+source between hosts. Git transfers their files and history; it does not transfer
+live interpreter state or grant permission to execute that source. The embedding
+host decides which repository is mounted into a room, what code it loads, and
+which effects, credentials and resources it admits. Fetching a repository must
+not implicitly promote it to a runtime library or run initialization code. See
+[the Clojure import example](clojure-api.md#import-a-public-git-repository-without-a-physical-checkout)
+for the existing connection-level APIs and their ownership contract.

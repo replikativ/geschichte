@@ -12,6 +12,64 @@ Geschichte deliberately exposes small namespaces rather than one generated API.
 | `geschichte.git.http` | injectable smart-HTTP clone/fetch/push/pull |
 | `geschichte.git.transport` | JVM HTTP/SSH transport selection |
 
+## Import a public Git repository without a physical checkout
+
+The JVM host supplies and owns a fresh initialized Datahike repository. The Git
+transport writes files and exact Git objects directly into Geschichte; neither a
+`.git` directory nor a native Git process is needed for HTTP import.
+
+```clojure
+(require '[geschichte.repo :as repo]
+         '[geschichte.git.transport :as transport]
+         '[geschichte.git.client :as client])
+
+;; `conn` is an exclusively owned, initialized, empty Geschichte repository.
+(def url "https://github.com/octocat/Hello-World.git")
+(def imported
+  (transport/clone! {:conn conn :remote "origin" :url url}))
+
+(keys (repo/worktree conn))              ; => ("README")
+(String. ^bytes (repo/read conn "README") "UTF-8")
+(repo/configuration conn)                ; saved origin and branch upstream
+
+;; Fetch changes without publishing them into the current worktree.
+(def fetched
+  (transport/fetch! {:conn conn :remote "origin" :url url
+                     :options {:haves [(:git-oid imported)]}}))
+
+;; Apply separately, after the host has checked its permissions and policy.
+(client/apply-pull! conn "origin" fetched {:policy :ff-only})
+```
+
+`:haves` is an explicit protocol-v2 hint supported by both HTTP and SSH fetch.
+Each supplied OID must name a commit whose **complete reachable object graph**
+is still available in the selected object store. A successful full clone's tips
+are suitable while retained. A remote-tracking ref alone, or a materialized
+logical commit, is not proof of that availability. History materialization can
+be bounded while the exact imported Git objects remain complete. Omitting
+`:haves` preserves the full-fetch behavior; providing one branch's tip may still
+transfer objects for other branches. Automatic negotiation is not implemented.
+Callers own the connection/object-store lifetime and coordinate garbage
+collection during these operations.
+
+Fetch imports objects and updates remote-tracking refs; it preserves the local
+worktree and index. Applying a pull requires a clean worktree/index and defaults
+to fast-forward only. Divergence is refused rather than overwriting local work;
+the lower-level API also supports explicit merge preparation. `:no-checkout?`
+clones retain the remote configuration without selecting a branch upstream.
+Clone failures can leave an unpublished partial repository; its host owns
+cleanup, publication and retries. A clone is not a permission grant or an
+instruction to load imported code.
+
+`transport/clone!` chooses the ordinary JVM HTTP/SSH adapter and saves repository
+configuration. For custom authentication or network policy, inject a host-owned
+request function into `geschichte.git.http/clone!` / `fetch!` instead. These
+lower-level transport functions do not configure the origin for the caller.
+Keep credentials out of repository URLs/configuration. Embedded sandboxes must
+not receive the default host transport implicitly. GitHub shorthand, connection
+permissions, recurring synchronization, webhook handling and UI belong to the
+embedding application.
+
 ## Filesystem API
 
 ```clojure
