@@ -38,7 +38,9 @@ transport writes files and exact Git objects directly into Geschichte; neither a
                      :options {:haves [(:git-oid imported)]}}))
 
 ;; Apply separately, after the host has checked its permissions and policy.
-(client/apply-pull! conn "origin" fetched {:policy :ff-only})
+(client/apply-pull! conn "origin" fetched
+                    {:policy :ff-only
+                     :branch (subs (:ref imported) (count "refs/heads/"))})
 ```
 
 `:haves` is an explicit protocol-v2 hint supported by both HTTP and SSH fetch.
@@ -69,6 +71,39 @@ Keep credentials out of repository URLs/configuration. Embedded sandboxes must
 not receive the default host transport implicitly. GitHub shorthand, connection
 permissions, recurring synchronization, webhook handling and UI belong to the
 embedding application.
+
+## Incoming synchronization
+
+`transport/pull!` uses the checked-out local branch's saved upstream when it
+matches the requested remote. An explicit `:options {:branch "docs"}` overrides
+that source selection. The remote source branch is independent of an optional
+local destination `:ref`; changing the remote's default HEAD does not retarget an
+existing clone. If the selected branch disappears from the fetched advertisement,
+pull refuses rather than using a stale tracking ref or falling back to HEAD.
+
+```clojure
+(transport/pull! {:conn conn :remote "origin" :url url
+                  :options {:policy :ff-only
+                            :haves [(:git-oid imported)]}})
+```
+
+Success includes `:pull/status` of `:initialized`, `:up-to-date`, `:fast-forward`
+or `:local-ahead`. The default policy does not merge divergent histories or push
+local commits. Expected refusals expose `:pull/status` in `ex-data`:
+`:local-changes`, `:diverged`, `:missing-branch` or `:unsupported-upstream`.
+Fetch may update remote-tracking metadata even when applying the pull is refused;
+the local worktree/index remain unchanged on these precondition refusals.
+
+These APIs require exclusive caller ownership of the mutable repository during
+application. Checkout/materialization can replace files in multiple transactions;
+it is **not an atomic publication API for a concurrently edited live Memory**.
+For a collaborative host, prepare downloads/checkouts in a privately owned
+workspace and publish through a separately guarded merge/proposal operation.
+Host permissions, source revision checks, cleanup, resource limits and incoming
+sync scheduling remain explicit responsibilities. An exception after
+materialization starts may leave partial private preparation; it must not be
+advertised as a published sync or replayed blindly. No push authorization is
+implied by fetching or successfully applying an incoming update.
 
 ## Filesystem API
 

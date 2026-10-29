@@ -92,10 +92,14 @@
                                                  2048)})
             :fetched fetched))))
 
-(defn- fetched-head [fetched]
-  (or (some #(when (= "HEAD" (:ref %)) %) (:refs fetched))
-      (some #(when (.startsWith ^String (:ref %) "refs/heads/") %)
-            (:refs fetched))))
+(defn- fetched-head [fetched branch]
+  (if branch
+    (or (some #(when (= (str "refs/heads/" branch) (:ref %)) %) (:refs fetched))
+        (throw (ex-info "Fetched remote branch is missing"
+                        {:pull/status :missing-branch :branch branch})))
+    (or (some #(when (= "HEAD" (:ref %)) %) (:refs fetched))
+        (some #(when (.startsWith ^String (:ref %) "refs/heads/") %)
+              (:refs fetched)))))
 
 (defn- ensure-current-oid! [conn object-store commit]
   (or (:geschichte.commit/git-oid
@@ -124,14 +128,16 @@
 
 (defn apply-pull!
   "Apply an already-fetched result with explicit `:ff-only` or `:merge` policy.
+  Optional :branch selects the remote source branch, independently of :ref,
+  the local destination. A missing selected branch never falls back to HEAD.
   Ancestry is decided from exact Git objects before worktree mutation."
   ([conn remote fetched] (apply-pull! conn remote fetched nil))
-  ([conn remote fetched {:keys [policy ref object-store]
+  ([conn remote fetched {:keys [policy ref object-store branch]
                          :or {policy :ff-only}}]
    (when-not (:clean? (repo/status conn))
      (throw (ex-info "Pull requires a clean worktree and index"
-                     {:status (repo/status conn)})))
-   (let [remote-head (fetched-head fetched)
+                     {:pull/status :local-changes :status (repo/status conn)})))
+   (let [remote-head (fetched-head fetched branch)
          remote-oid (:oid remote-head)
          current-ref (repo/current-ref conn)
          current (repo/head-commit conn)
@@ -159,7 +165,7 @@
            (= policy :ff-only)
            (throw (ex-info "Pull is not a fast-forward"
                            {:current current-oid :remote remote-oid
-                            :policy policy}))
+                            :policy policy :pull/status :diverged}))
 
            (= policy :merge)
            (let [temporary-ref (str "refs/pull/" remote)

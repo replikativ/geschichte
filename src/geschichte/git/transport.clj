@@ -43,10 +43,25 @@
       (http/fetch! conn remote url options)
       (ssh/fetch! conn remote (ssh-argv-fn url) options))))
 
-(defn pull! [{:keys [conn remote url options]}]
-  (if (http? url)
-    (http/pull! conn remote url options)
-    (ssh/pull! conn remote (ssh-argv-fn url) options)))
+(defn pull!
+  "Pull the configured upstream branch for this remote, or explicit :branch.
+  The remote's default HEAD may change without changing our tracked branch."
+  [{:keys [conn remote url options]}]
+  (let [local-ref (repo/current-ref conn)
+        branch (when (str/starts-with? (or local-ref "") "refs/heads/")
+                 (subs local-ref (count "refs/heads/")))
+        config (repo/configuration conn)
+        upstream (when (= remote (get config (str "branch." branch ".remote")))
+                   (get config (str "branch." branch ".merge")))
+        options (if (or (:branch options) (nil? upstream)) options
+                    (do
+                      (when-not (str/starts-with? upstream "refs/heads/")
+                        (throw (ex-info "Configured upstream is not a remote branch"
+                                        {:pull/status :unsupported-upstream :ref upstream})))
+                      (assoc options :branch (subs upstream (count "refs/heads/")))))]
+    (if (http? url)
+      (http/pull! conn remote url options)
+      (ssh/pull! conn remote (ssh-argv-fn url) options))))
 
 (defn push! [{:keys [conn url commit-id options]}]
   (if (http? url)

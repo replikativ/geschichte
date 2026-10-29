@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [geschichte.git.ssh :as ssh]
             [geschichte.git.client :as client]
+            [geschichte.git.transport :as transport]
             [geschichte.repo :as repo]
             [datahike.api :as d]))
 
@@ -42,7 +43,7 @@
             argv-fn #(ssh/local-argv {:path (.getPath root) :service %})]
         (try
           (repo/init! conn)
-          (let [cloned (ssh/clone! conn "origin" argv-fn nil)
+          (let [cloned (ssh/clone! conn "origin" argv-fn {:ref "refs/heads/local"})
                 haves [(:git-oid cloned)]
                 unchanged (ssh/fetch! conn "origin" argv-fn {:haves haves})]
             (is (= 0 (:persisted unchanged)))
@@ -55,6 +56,41 @@
               (is (= :fast-forward (:pull/status (client/apply-pull! conn "origin" fetched))))
               (is (= "one\n" (String. ^bytes (repo/read conn "README.md") "UTF-8")))
               (is (= "two\n" (String. ^bytes (repo/read conn "notes.md") "UTF-8"))))
+            (repo/set-config! conn "branch.local.remote" "origin")
+            (repo/set-config! conn "branch.local.merge" "refs/heads/main")
+            (let [pull! (fn [options]
+                          (with-redefs [ssh/ssh-argv (fn [{:keys [service]}] (argv-fn service))]
+                            (transport/pull! {:conn conn :remote "origin"
+                                              :url "git@example.test:repo.git"
+                                              :options options})))
+                  outcome (fn [options]
+                            (try (pull! options)
+                                 (catch clojure.lang.ExceptionInfo error (ex-data error))))]
+              ;; Changing the remote's default branch must not redirect sync.
+              (git! "switch" "-q" "-c" "docs")
+              (spit (java.io.File. root "docs.md") "different branch\n")
+              (git! "add" "docs.md")
+              (git! "commit" "-q" "-m" "docs")
+              (is (= :up-to-date (:pull/status (pull! nil))))
+              (is (= "refs/heads/local" (repo/current-ref conn)))
+              (is (nil? (repo/read conn "docs.md")))
+              (git! "switch" "-q" "main")
+              (spit (java.io.File. root "main.md") "tracked branch\n")
+              (git! "add" "main.md")
+              (git! "commit" "-q" "-m" "main update")
+              (git! "switch" "-q" "docs")
+              (is (= :fast-forward (:pull/status (pull! nil))))
+              (is (= "refs/heads/local" (repo/current-ref conn)))
+              (is (= "tracked branch\n" (String. ^bytes (repo/read conn "main.md") "UTF-8")))
+              (is (nil? (repo/read conn "docs.md")))
+              (let [before (repo/worktree conn)]
+                (is (= :diverged (:pull/status (outcome {:branch "docs"}))))
+                (is (= before (repo/worktree conn))))
+              (git! "branch" "-D" "main")
+              (is (= :missing-branch (:pull/status (outcome nil))))
+              (is (nil? (repo/read conn "docs.md")))
+              (repo/write! conn "draft.md" (.getBytes "local draft\n" "UTF-8"))
+              (is (= :local-changes (:pull/status (outcome nil)))))
             (repo/write! conn "draft.md" (.getBytes "local draft\n" "UTF-8"))
             (let [fetched (ssh/fetch! conn "origin" argv-fn {:haves haves})]
               (is (thrown-with-msg? clojure.lang.ExceptionInfo #"clean worktree"
