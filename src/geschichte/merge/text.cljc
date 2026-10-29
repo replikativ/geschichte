@@ -127,7 +127,7 @@
    metadata: a merge must reproduce the file's bytes, and the round trip
    `split → join` is exact for that as long as both halves agree."
   [base ours theirs]
-  (let [split #(if (str/blank? %) [] (str/split (or % "") #"\n" -1))
+  (let [split #(if (empty? %) [] (str/split (or % "") #"\n" -1))
         r (merge-lines (split base) (split ours) (split theirs))]
     (-> r
         (assoc :text (str/join "\n" (:lines r)))
