@@ -33,6 +33,15 @@ uncommitted files, staging state, or unrelated refs. Advance is explicit and
 requires a clean target. Discard removes the physical Datahike branch; unreachable
 payloads become eligible for garbage collection.
 
+Publishing with `:create? true` may create a missing logical ref. Absence is
+checked inside the same serialized transaction as its content and ref transfer;
+an unforced competing creation refuses with
+`:geschichte.workspace/publication-ref-exists` and leaves the winning state
+untouched. An existing unborn ref is distinct from a missing ref and advances
+through the ordinary target compare-and-swap. `:force? true` deliberately permits
+replacement, including a ref created after preparation; callers must authorize
+that stronger policy explicitly.
+
 ### Advance invariants
 
 `advance!` observes one immutable canonical snapshot and updates only the target's

@@ -332,12 +332,19 @@
   (io-result #?(:clj (d/merge-db conn parents tx-data)
                 :cljs (d/merge-db! conn parents tx-data))))
 
+(defn- create-publication-ref-tx [db ref tip]
+  (when (d/q '[:find ?e . :in $ ?name :where [?e :geschichte.ref/name ?name]] db ref)
+    (throw (ex-info "Publication ref was created while preparing publication"
+                    {:type ::publication-ref-exists :ref ref})))
+  [{:geschichte.ref/name ref :geschichte.ref/target [:geschichte.commit/id tip]}])
+
 (defn publish!
   "Publish one logical workspace ref into a canonical Geschichte connection.
 
   The update is a fast-forward by default. `:db.fn/cas` checks the canonical
-  ref again inside the serialized Datahike merge transaction, so concurrent
-  publishers cannot silently overwrite each other. `:force? true` permits a
+  ref again inside the serialized Datahike merge transaction, and newly created
+  refs validate absence there, so concurrent publishers cannot silently
+  overwrite each other. `:force? true` permits a
   deliberate non-fast-forward update.
 
   Only reachable immutable commit metadata and the selected ref are copied to
@@ -374,9 +381,10 @@
                           @canonical ref)
           ref-update (cond
                        (nil? ref-entity)
-                       {:geschichte.ref/name ref
-                        :geschichte.ref/target
-                        [:geschichte.commit/id tip]}
+                       (if force?
+                         {:geschichte.ref/name ref
+                          :geschichte.ref/target [:geschichte.commit/id tip]}
+                         [:db.fn/call create-publication-ref-tx ref tip])
 
                        force?
                        {:db/id ref-entity
