@@ -10,17 +10,56 @@
 (defn- ->bytes [s] (.getBytes ^String s "UTF-8"))
 (defn- text [bs] (when bs (String. ^bytes bs "UTF-8")))
 
-(defn- fixture []
-  (let [cfg {:store {:backend :memory :id (random-uuid)}
-             :schema-flexibility :write
-             :keep-history? true
-             :commit-graph? true}]
-    (d/create-database cfg)
-    {:cfg cfg :conn (d/connect cfg)}))
+(defn- fixture
+  ([] (fixture {}))
+  ([options]
+   (let [cfg (merge {:store {:backend :memory :id (random-uuid)}
+                     :schema-flexibility :write
+                     :keep-history? true
+                     :commit-graph? true} options)]
+     (d/create-database cfg)
+     {:cfg cfg :conn (d/connect cfg)})))
 
 (defn- cleanup [{:keys [cfg conn]}]
   (d/release conn)
   (d/delete-database cfg))
+
+(deftest path-range-guards-support-both-attribute-storage-modes
+  (doseq [attribute-refs? [false true]]
+    (let [{:keys [conn] :as f} (fixture {:attribute-refs? attribute-refs?})]
+      (try
+        (repo/init! conn)
+        ;; index-range's inclusive upper bound is only a neighboring name.
+        (repo/write! conn "a0" (->bytes "neighbor"))
+        (repo/write! conn "a" (->bytes "file"))
+        (is (= "file" (text (repo/read conn "a"))))
+        (let [before @conn]
+          (is (= :geschichte.tree/path-conflict
+                 (try (repo/write! conn "a/child" (byte-array 0)) nil
+                      (catch Exception error (:type (ex-data error))))))
+          (is (= before @conn)))
+        (repo/remove! conn "a")
+        (repo/write! conn "a/child" (->bytes "nested"))
+        (let [before @conn]
+          (is (= :geschichte.tree/path-conflict
+                 (try (repo/write! conn "a" (byte-array 0)) nil
+                      (catch Exception error (:type (ex-data error))))))
+          (is (= before @conn)))
+        ;; Leave only a nested explicit directory: there is no exact parent
+        ;; directory record, so the directory-prefix range must detect it.
+        (fs/write! conn "branch/seed" (byte-array 0))
+        (fs/mkdir! conn "branch/kept")
+        (fs/delete! conn "branch/seed")
+        (is (= :dir (:type (fs/stat conn "branch"))))
+        (let [before @conn]
+          (is (= :geschichte.tree/path-conflict
+                 (try (repo/write! conn "branch" (byte-array 0)) nil
+                      (catch Exception error (:type (ex-data error))))))
+          (is (= before @conn)))
+        (fs/mkdir! conn "directory0")
+        (repo/write! conn "directory" (->bytes "neighbor of explicit directory"))
+        (is (= "neighbor of explicit directory" (text (repo/read conn "directory"))))
+        (finally (cleanup f))))))
 
 (deftest amend-preserves-root-and-linear-topology
   (let [{:keys [conn] :as f} (fixture)]

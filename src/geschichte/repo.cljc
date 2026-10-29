@@ -123,10 +123,13 @@
   (path-tree/assert-valid! tree (explicit-directories db)))
 
 (defn- descendant [db attr path]
-  (when (contains? (d/schema db) attr)
-    (let [prefix (str path "/")]
+  (when-let [attribute (get (d/schema db) attr)]
+    ;; Unlike Datalog, index-range expects the stored attribute representation.
+    ;; Public schema metadata supplies its numeric ID in attribute-ref mode.
+    (let [attrid (if (get-in db [:config :attribute-refs?]) (:db/id attribute) attr)
+          prefix (str path "/")]
       (some (fn [datom] (when (str/starts-with? (:v datom) prefix) (:v datom)))
-            (d/index-range db {:attrid attr :start prefix :end (str path "0")})))))
+            (d/index-range db {:attrid attrid :start prefix :end (str path "0")})))))
 
 (defn- validate-write-path! [db path]
   (path-tree/assert-path! path)
