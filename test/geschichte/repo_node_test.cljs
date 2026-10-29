@@ -9,6 +9,44 @@
 (defn- take-cps [computation]
   (bridge/->chan computation))
 
+(deftest node-amend-retains-history
+  (async done
+         (go
+           (let [cfg {:store {:backend :memory :id (random-uuid)}
+                      :schema-flexibility :write :keep-history? true :commit-graph? true}
+                 owned (atom nil)]
+             (try
+               (<! (d/create-database cfg))
+               (let [conn (<! (d/connect cfg {:sync? false}))]
+                 (reset! owned conn)
+                 (bridge/unwrap-result (<! (take-cps (repo/init! conn))))
+                 (bridge/unwrap-result (<! (take-cps (repo/write! conn "a" (bytes/utf8 "one\n")))))
+                 (bridge/unwrap-result (<! (take-cps (repo/stage-all! conn))))
+                 (let [root (bridge/unwrap-result (<! (take-cps (repo/commit! conn {:message "root"}))))
+                       root-amended (bridge/unwrap-result
+                                     (<! (take-cps (repo/commit! conn {:message "root amended" :amend? true}))))]
+                   (is (empty? (:geschichte.commit/parents root-amended)))
+                   (bridge/unwrap-result (<! (take-cps (repo/write! conn "a" (bytes/utf8 "two\n")))))
+                   (bridge/unwrap-result (<! (take-cps (repo/stage-all! conn))))
+                   (let [second (bridge/unwrap-result (<! (take-cps (repo/commit! conn {:message "second"}))))
+                         amended (bridge/unwrap-result
+                                  (<! (take-cps (repo/commit! conn {:message "second amended" :amend? true}))))
+                         stored (repo/commit-by-id conn (:geschichte.commit/id amended))
+                         previous (bridge/unwrap-result
+                                   (<! (take-cps (repo/read-at conn (:geschichte.commit/id second) "a"))))
+                         initial (bridge/unwrap-result
+                                  (<! (take-cps (repo/read-at conn (:geschichte.commit/id root) "a"))))]
+                     (is (= #{(:geschichte.commit/id root-amended)}
+                            (set (map :geschichte.commit/id (:geschichte.commit/parents stored)))))
+                     (is (= "two\n" (bytes/decode-utf8 previous)))
+                     (is (= "one\n" (bytes/decode-utf8 initial))))))
+               (catch :default error
+                 (is false (str "Node amend test failed: " (.-message error))))
+               (finally
+                 (when-let [conn @owned] (d/release conn))
+                 (<! (d/delete-database cfg))
+                 (done)))))))
+
 (deftest node-worktree-stage-and-status
   (async done
          (go
