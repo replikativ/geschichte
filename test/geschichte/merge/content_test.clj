@@ -181,3 +181,39 @@
                        (repo/commit-by-id conn (:geschichte.commit/id
                                                 (repo/head-commit conn))))))
           "and it is a real two-parent merge commit"))))
+
+(deftest malformed-utf8-is-binary-not-replacement-text
+  (let [[conn ours theirs] (two-sided (bytes/from-values [255])
+                                      (bytes/from-values [254])
+                                      (bytes/from-values [253]) "blob.bin")
+        before @conn]
+    (try
+      (let [p (gmerge/plan conn ours theirs)]
+        (is (not (:clean? p)))
+        (is (= ["blob.bin"] (keys (:conflicts p))))
+        (is (empty? (:merged p)))
+        (is (= before @conn) "declining binary content writes no replacement blob"))
+      (finally (d/release conn)))))
+
+(deftest identical-binary-changes-remain-structural
+  (let [[conn ours theirs] (two-sided (bytes/from-values [255])
+                                      (bytes/from-values [254])
+                                      (bytes/from-values [254]) "blob.bin")]
+    (try
+      (let [p (gmerge/plan conn ours theirs)]
+        (is (:clean? p))
+        (is (empty? (:merged p)))
+        (is (bytes/same-bytes? (bytes/from-values [254])
+                               (content/read-by-id conn (get-in p [:tree "blob.bin" :content])))))
+      (finally (d/release conn)))))
+
+(deftest valid-unicode-content-is-byte-faithful
+  (let [[conn ours theirs] (two-sided (bytes/utf8 "α\r\n \t\r\n終\r\n")
+                                      (bytes/utf8 "β\r\n \t\r\n終\r\n")
+                                      (bytes/utf8 "α\r\n \t\r\n末\r\n"))]
+    (try
+      (let [p (gmerge/plan conn ours theirs)]
+        (is (:clean? p))
+        (is (bytes/same-bytes? (bytes/utf8 "β\r\n \t\r\n末\r\n")
+                               (content/read-by-id conn (get-in p [:tree "f.txt" :content])))))
+      (finally (d/release conn)))))

@@ -5,7 +5,8 @@
   Uint8Array directly through reader conditionals. No persistent-vector
   conversion occurs on the CLJS path."
   #?(:clj (:import [java.io ByteArrayOutputStream]
-                   [java.nio.charset StandardCharsets]
+                   [java.nio ByteBuffer]
+                   [java.nio.charset StandardCharsets CodingErrorAction]
                    [java.util Arrays])))
 
 (defn byte-buffer?
@@ -34,6 +35,15 @@
 (defn decode-utf8 [bytes]
   #?(:clj (String. ^bytes bytes StandardCharsets/UTF_8)
      :cljs (.decode (js/TextDecoder. "utf-8") bytes)))
+
+(defn decode-utf8-strict
+  "Decode UTF-8 without replacing malformed bytes. Throws on invalid input."
+  [bytes]
+  #?(:clj (str (.decode (doto (.newDecoder StandardCharsets/UTF_8)
+                          (.onMalformedInput CodingErrorAction/REPORT)
+                          (.onUnmappableCharacter CodingErrorAction/REPORT))
+                        (ByteBuffer/wrap bytes)))
+     :cljs (.decode (js/TextDecoder. "utf-8" #js {:fatal true :ignoreBOM true}) bytes)))
 
 (defn decode-ascii
   ([bytes] (decode-ascii bytes 0 (length bytes)))

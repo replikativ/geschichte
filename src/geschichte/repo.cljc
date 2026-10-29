@@ -994,7 +994,7 @@
          (let [texts (mapv (fn [{:keys [content]}]
                              (try
                                (let [bs (content/read-by-id conn content)
-                                     s (when bs (bytes/decode-utf8 bs))]
+                                     s (when bs (bytes/decode-utf8-strict bs))]
                                  (when (and s (not (str/includes? s "\u0000")))
                                    s))
                                (catch #?(:clj Exception :cljs :default) _ nil)))
