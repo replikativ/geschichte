@@ -5,6 +5,21 @@ subcommand name. Unsupported options must fail before state changes. This file i
 the implementation manifest for scenario replay and future native-Git differential
 tests.
 
+## Portable checkout paths
+
+Checkout accepts lossless UTF-8 component names within Geschichte's portable
+path model. Internal spaces and Unicode spelling are preserved. Components
+containing literal backslashes, embedded separators, NULs or only whitespace,
+and reserved administrative names, refuse with
+`:geschichte.git.checkout/unsupported-entry-name` before host path normalization.
+Some excluded names, such as literal backslashes or whitespace-only names, are
+valid in Unix Git repositories; they are unsupported here rather than silently
+renamed. Invalid UTF-8 bytes also refuse instead of aliasing replacement text.
+
+Clone/materialization still requires an exclusively owned preparation repository.
+With streamed input, a later unsupported name may leave earlier valid entries in
+private preparation; no successful checkout should be exposed in that case.
+
 ## Current command surface
 
 | Area | Commands | Current faithful subset |
