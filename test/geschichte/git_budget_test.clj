@@ -1,5 +1,6 @@
 (ns geschichte.git-budget-test
   (:require [clojure.test :refer [deftest is]]
+            [geschichte.budget :as operation]
             [geschichte.git.budget :as budget])
   (:import [java.io ByteArrayInputStream]))
 
@@ -26,6 +27,16 @@
     (budget/charge! b :checkout-bytes Long/MAX_VALUE)
     (is (= ::budget/exceeded (:type (refusal #(budget/charge! b :checkout-bytes 1)))))
     (is (= Long/MAX_VALUE (get-in (budget/snapshot b) [:used :checkout-bytes])))))
+
+(deftest portable-kernel-and-git-adapter-share-the-same-handle
+  (is (= ::operation/invalid-policy (:type (refusal #(operation/create {:unknown true})))))
+  (is (= ::budget/invalid-policy (:type (refusal #(budget/create {:unknown true})))))
+  (let [b (budget/create {:limits {:objects 1}})]
+    (operation/charge! b :objects 1)
+    (is (= {:type ::budget/exceeded :metric :objects :limit 1 :used 1 :requested 1}
+           (refusal #(budget/charge! b :objects 1))))
+    (is (= 1 (get-in (operation/snapshot b) [:used :objects])))
+    (is (= ::budget/exceeded (:type (refusal #(operation/check! b)))))))
 
 (deftest cancellation-and-deadline-are-distinct
   (is (= ::budget/cancelled (:type (refusal #(budget/check! (budget/create {:cancelled? (constantly true)}))))))

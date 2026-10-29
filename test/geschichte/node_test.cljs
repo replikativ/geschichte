@@ -1,6 +1,7 @@
 (ns geschichte.node-test
   (:require [cljs.test :as test]
             [geschichte.async-node-test]
+            [geschichte.budget-test]
             [geschichte.chunk-test]
             [geschichte.content-node-test]
             [geschichte.content-range-node-test]
@@ -29,6 +30,7 @@
 
 (defn -main [& _]
   (test/run-tests 'geschichte.async-node-test
+                  'geschichte.budget-test
                   'geschichte.chunk-test
                   'geschichte.content-node-test
                   'geschichte.content-range-node-test
