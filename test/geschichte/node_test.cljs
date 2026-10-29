@@ -14,6 +14,7 @@
             [geschichte.merge-core-test]
             [geschichte.merge.whitespace-test]
             [geschichte.strict-utf8-test]
+            [geschichte.merge.overlap-test]
             [geschichte.query-node-test]
             [geschichte.repo-node-test]
             [geschichte.tree-test]
@@ -41,6 +42,7 @@
                   'geschichte.merge-core-test
                   'geschichte.merge.whitespace-test
                   'geschichte.strict-utf8-test
+                  'geschichte.merge.overlap-test
                   'geschichte.query-node-test
                   'geschichte.repo-node-test
                   'geschichte.tree-test
