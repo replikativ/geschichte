@@ -45,6 +45,8 @@
                         (bridge/unwrap-result
                          (<! (take-cps
                               (workspace/fork! canonical "node-agent"))))))
+                 (bridge/unwrap-result
+                  (<! (take-cps (workspace/fork! canonical "node-observer"))))
                  (let [worker (<! (d/connect
                                    (assoc cfg :branch
                                           :geschichte.workspace/node-agent)
@@ -69,7 +71,38 @@
                                            (:geschichte.commit/id commit)
                                            "node.txt"))))]
                      (is (= (:geschichte.commit/id commit) (:new published)))
-                     (is (= "node\n" (bytes/decode-utf8 historical))))
+                     (is (= "node\n" (bytes/decode-utf8 historical)))
+                     (let [observer (<! (d/connect
+                                         (assoc cfg :branch :geschichte.workspace/node-observer)
+                                         {:sync? false}))]
+                       (try
+                         (let [merge-db! d/merge-db!
+                               edited (atom nil)
+                               failure
+                               (with-redefs [d/merge-db!
+                                             (fn [conn parents tx]
+                                               (go
+                                                 (bridge/unwrap-result
+                                                  (<! (take-cps (repo/write! observer "base.txt" (bytes/utf8 "concurrent\n")))))
+                                                 (reset! edited @observer)
+                                                 (<! (merge-db! conn parents tx))))]
+                                 (try
+                                   (bridge/unwrap-result
+                                    (<! (take-cps (workspace/advance! canonical observer))))
+                                   nil
+                                   (catch :default error error)))]
+                           (is (= ::workspace/stale-advance (:type (ex-data failure))))
+                           (is (= @edited @observer))
+                           ;; Restore the private edit before the successful advance.
+                           (bridge/unwrap-result
+                            (<! (take-cps (repo/write! observer "base.txt" (bytes/utf8 "base\n"))))))
+                         (let [advanced (bridge/unwrap-result
+                                         (<! (take-cps (workspace/advance! canonical observer))))
+                               observed (bridge/unwrap-result
+                                         (<! (take-cps (repo/read observer "node.txt"))))]
+                           (is (= (:geschichte.commit/id commit) (:new advanced)))
+                           (is (= "node\n" (bytes/decode-utf8 observed))))
+                         (finally (d/release observer)))))
                    (d/release worker))
                  (d/release canonical))
                (catch :default error

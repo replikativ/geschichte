@@ -54,6 +54,55 @@
         (is (empty? (workspace/list canonical))))
       (finally (cleanup f)))))
 
+(deftest advancing-requires-the-current-ref-and-no-pending-merge
+  (let [{:keys [cfg canonical] :as f} (fixture)]
+    (try
+      (repo/branch! canonical "other")
+      (workspace/fork! canonical "observer")
+      (let [observer (d/connect (assoc cfg :branch :geschichte.workspace/observer))]
+        (try
+          (let [before @observer
+                error (try (workspace/advance! canonical observer {:ref "other"}) nil
+                           (catch Exception e e))]
+            (is (= :geschichte.workspace/noncurrent-ref (:type (ex-data error))))
+            (is (= before @observer)))
+          (let [head (get (repo/refs observer) "refs/heads/main")]
+            (d/transact observer [[:db/add (:db/id (query/repository @observer))
+                                   :geschichte.repo/merge-parent [:geschichte.commit/id head]]]))
+          (let [before @observer
+                error (try (workspace/advance! canonical observer) nil
+                           (catch Exception e e))]
+            (is (= :geschichte.workspace/pending-merge (:type (ex-data error))))
+            (is (= before @observer)))
+          (finally (d/release observer))))
+      (finally (cleanup f)))))
+
+(deftest advancing-uses-one-source-snapshot
+  (let [{:keys [cfg canonical] :as f} (fixture)]
+    (try
+      (workspace/fork! canonical "observer")
+      (let [observer (d/connect (assoc cfg :branch :geschichte.workspace/observer))]
+        (try
+          (repo/write! canonical "base.txt" (->bytes "remote\n"))
+          (repo/stage-all! canonical)
+          (let [tip (:geschichte.commit/id (repo/commit! canonical {:message "remote"}))
+                checkpoint (d/commit-id @canonical)
+                tree-at repo/tree-at
+                result (with-redefs [repo/tree-at
+                                     (fn [conn commit]
+                                       (let [tree (tree-at conn commit)]
+                                         (repo/write! canonical "base.txt" (->bytes "later\n"))
+                                         (repo/stage-all! canonical)
+                                         (repo/commit! canonical {:message "later"})
+                                         tree))]
+                         (workspace/advance! canonical observer))]
+            (is (= tip (:new result)))
+            (is (= checkpoint (:canonical-commit result)))
+            (is (not= checkpoint (d/commit-id @canonical)))
+            (is (= "remote\n" (text (repo/read observer "base.txt")))))
+          (finally (d/release observer))))
+      (finally (cleanup f)))))
+
 (deftest publication-is-selective-atomic-and-gc-reachable
   (let [{:keys [cfg canonical] :as f} (fixture)]
     (try
@@ -140,4 +189,32 @@
           (finally
             (d/release producer)
             (d/release observer))))
+      (finally (cleanup f)))))
+
+(deftest advancing-refuses-an-intervening-worktree-edit
+  (let [{:keys [cfg canonical] :as f} (fixture)]
+    (try
+      (workspace/fork! canonical "observer")
+      (let [observer (d/connect (assoc cfg :branch :geschichte.workspace/observer))
+            edited (atom nil)
+            merge-var (ns-resolve 'geschichte.workspace 'merge-data)
+            merge-data @merge-var]
+        (try
+          (let [old (repo/refs observer)]
+            (repo/write! canonical "base.txt" (->bytes "remote\n"))
+            (repo/stage-all! canonical)
+            (repo/commit! canonical {:message "remote"})
+            (let [error (with-redefs-fn
+                          {merge-var (fn [conn parents tx]
+                                       (repo/write! observer "base.txt" (->bytes "concurrent\n"))
+                                       (reset! edited @observer)
+                                       (merge-data conn parents tx))}
+                          #(try (workspace/advance! canonical observer) nil
+                                (catch Exception e e)))]
+              (is (some? error))
+              (is (= :geschichte.workspace/stale-advance (:type (ex-data error))))
+              (is (= @edited @observer))
+              (is (= "concurrent\n" (text (repo/read observer "base.txt"))))
+              (is (= old (repo/refs observer)))))
+          (finally (d/release observer))))
       (finally (cleanup f)))))

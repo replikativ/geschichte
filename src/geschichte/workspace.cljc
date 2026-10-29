@@ -424,23 +424,54 @@
        :geschichte.stage/mode mode}])
    tree))
 
+(defn- advance-basis [db]
+  {:store (select-keys (get-in db [:config :store]) [:backend :id])
+   :branch (get-in db [:config :branch])
+   :repository (query/repository db)
+   :checkpoint (d/commit-id db)
+   :max-tx (:max-tx db)
+   :ref (query/current-ref db)
+   :refs (query/refs db)
+   :index (query/stage db)
+   :worktree (query/worktree db)})
+
+(defn- guarded-advance-tx [db basis tx-data]
+  (when-not (= basis (advance-basis db))
+    (throw (ex-info "Workspace changed while preparing advance"
+                    {:type ::stale-advance :ref (:ref basis)})))
+  tx-data)
+
 (defn advance!
   "Fast-forward a clean workspace ref to the corresponding canonical ref.
 
   This is the manual observation step for a frozen Yggdrasil overlay. Immutable
   commit/content facts and the committed tree are imported atomically; private
-  workspace config and unrelated refs remain untouched."
+  workspace config and unrelated refs remain untouched. Only the checked-out
+  ref can advance, and pending merges are refused. Preparation uses immutable
+  source/target snapshots; any intervening target transaction refuses the
+  publication without overwriting concurrent edits."
   ([canonical workspace] (advance! canonical workspace {}))
   ([canonical workspace {:keys [ref]}]
    (platform-async
-    (let [ref (normalize-ref (or ref (repo/current-ref workspace)))
-          status (await (repo/status workspace))
+    (let [source-db @canonical
+          target-db @workspace
+          source (atom source-db)
+          target (atom target-db)
+          basis (advance-basis target-db)
+          ref (normalize-ref (or ref (:ref basis)))
+          _ (when-not (= ref (:ref basis))
+              (throw (ex-info "Workspace advance requires the checked-out ref"
+                              {:type ::noncurrent-ref :ref ref :current (:ref basis)})))
+          _ (when (:geschichte.repo/merge-parent (:repository basis))
+              (throw (ex-info "Cannot advance a workspace with a pending merge"
+                              {:type ::pending-merge :ref ref})))
+          status (await (repo/status target))
           _ (when (or (seq (:staged status)) (seq (:unstaged status)))
               (throw (ex-info "Cannot advance a dirty workspace"
                               {:status status :ref ref})))
-          source-commits (commit-index @canonical)
-          tip (get (repo/refs canonical) ref)
-          old (get (repo/refs workspace) ref ::missing)
+          source-commits (commit-index source-db)
+          tip (get (repo/refs source) ref)
+          old (get (repo/refs target) ref ::missing)
           _ (when (or (= ::missing old) (nil? tip))
               (throw (ex-info "Ref is unavailable for workspace advance"
                               {:ref ref :workspace old :canonical tip})))
@@ -448,32 +479,33 @@
           _ (when (and old (not (contains? reachable old)))
               (throw (ex-info "Workspace advance is not a fast-forward"
                               {:ref ref :old old :new tip})))
-          tree (await (repo/tree-at canonical tip))
+          tree (await (repo/tree-at source tip))
           conflicting-untracked (set/intersection
                                  (set (:untracked status))
                                  (set (keys tree)))
           _ (when (seq conflicting-untracked)
               (throw (ex-info "Workspace advance would overwrite untracked files"
                               {:ref ref :paths conflicting-untracked})))
-          transfer (transfer-data @canonical @workspace source-commits tip tree)
+          transfer (transfer-data source-db target-db source-commits tip tree)
           ref-eid (d/q '[:find ?ref .
                          :in $ ?name
                          :where [?ref :geschichte.ref/name ?name]]
-                       @workspace ref)
+                       target-db ref)
           ref-update [:db.fn/cas ref-eid :geschichte.ref/target
                       (when old [:geschichte.commit/id old])
                       [:geschichte.commit/id tip]]
-          tracked-paths (set/union (set (keys (query/stage @workspace)))
+          tracked-paths (set/union (set (keys (query/stage target-db)))
                                    (set (keys tree)))
           tx-data (vec
                    (concat (:tx-data transfer)
-                           (retract-paths @workspace :geschichte.work/path
+                           (retract-paths target-db :geschichte.work/path
                                           tracked-paths)
-                           (retract-entities @workspace :geschichte.stage/path)
+                           (retract-entities target-db :geschichte.stage/path)
                            (materialize-tx tree)
                            [ref-update]))
-          canonical-head (d/commit-id @canonical)]
-      (await (merge-data workspace #{canonical-head} tx-data))
+          canonical-head (d/commit-id source-db)]
+      (await (merge-data workspace #{canonical-head}
+                         [[:db.fn/call guarded-advance-tx basis tx-data]]))
       {:ref ref :old old :new tip
        :copied-commits (count (:copied-commits transfer))
        :copied-content (count (:copied-content transfer))
