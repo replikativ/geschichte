@@ -461,12 +461,26 @@
   workspace config and unrelated refs remain untouched. Only the checked-out
   ref can advance, and pending merges are refused. Preparation uses immutable
   source/target snapshots; any intervening target transaction refuses the
-  publication without overwriting concurrent edits."
+  publication without overwriting concurrent edits. Optional :expected-checkpoint
+  binds the caller's previously inspected target checkpoint to that same captured
+  target snapshot. A stale token refuses before preparation; it never refreshes
+  itself implicitly."
   ([canonical workspace] (advance! canonical workspace {}))
-  ([canonical workspace {:keys [ref]}]
+  ([canonical workspace {:keys [ref expected-checkpoint] :as opts}]
    (platform-async
-    (let [source-db @canonical
+    (let [_ (when (or (seq (set/difference (set (keys opts)) #{:ref :expected-checkpoint}))
+                      (and (contains? opts :expected-checkpoint)
+                           (not (uuid? expected-checkpoint))))
+              (throw (ex-info "Invalid workspace advance options"
+                              {:type ::invalid-advance-options})))
+          source-db @canonical
           target-db @workspace
+          _ (when (and expected-checkpoint
+                       (not= expected-checkpoint (d/commit-id target-db)))
+              (throw (ex-info "Workspace changed since the caller inspected it"
+                              {:type ::stale-advance
+                               :expected-checkpoint expected-checkpoint
+                               :actual-checkpoint (d/commit-id target-db)})))
           source (atom source-db)
           target (atom target-db)
           basis (advance-basis target-db)

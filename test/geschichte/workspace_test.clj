@@ -292,7 +292,8 @@
           (repo/write! observer "scratch.tmp" (->bytes "untracked\n"))
           (let [commit (repo/commit! producer {:message "new"})]
             (workspace/publish! canonical producer)
-            (let [advanced (workspace/advance! canonical observer)]
+            (let [advanced (workspace/advance! canonical observer
+                                               {:expected-checkpoint (d/commit-id @observer)})]
               (is (= (:geschichte.commit/id commit) (:new advanced)))
               (is (= "new\n" (text (repo/read observer "new.txt"))))
               (is (= "untracked\n" (text (repo/read observer "scratch.tmp"))))
@@ -301,6 +302,43 @@
             (d/release producer)
             (d/release observer))))
       (finally (cleanup f)))))
+
+(deftest advance-refuses-a-stale-caller-checkpoint-before-preparation
+  (doseq [change [:worktree :config :head]]
+    (let [{:keys [cfg canonical] :as f} (fixture)]
+      (try
+        (workspace/fork! canonical "observer")
+        (let [observer (d/connect (assoc cfg :branch :geschichte.workspace/observer))]
+          (try
+            (let [expected (d/commit-id @observer)
+                  old-head (repo/refs observer)]
+              (repo/write! canonical "incoming.txt" (->bytes "incoming\n"))
+              (repo/stage-all! canonical)
+              (repo/commit! canonical {:message "incoming"})
+              ;; The host/human inspected expected. Another operation then
+              ;; changes the destination before advance! captures its own DB.
+              (case change
+                :worktree (repo/write! observer "scratch.tmp" (->bytes "preserve\n"))
+                :config (repo/set-config! observer "example.setting" "preserve")
+                :head (do (repo/write! observer "local.txt" (->bytes "local\n"))
+                          (repo/stage-all! observer)
+                          (repo/commit! observer {:message "local"})))
+              (let [before @observer
+                    error (try (workspace/advance! canonical observer {:expected-checkpoint expected})
+                               nil (catch Exception e e))]
+                (is (= ::workspace/stale-advance (:type (ex-data error))))
+                (is (= expected (:expected-checkpoint (ex-data error))))
+                (is (= (d/commit-id before) (:actual-checkpoint (ex-data error))))
+                (is (= before @observer))
+                (when (not= :head change) (is (= old-head (repo/refs observer))))))
+            (finally (d/release observer))))
+        (finally (cleanup f))))))
+
+(deftest invalid-advance-options-refuse-before-accessing-either-repository
+  (doseq [options [{:expected-checkpoint nil} {:expected-checkpoint "not-a-checkpoint"}
+                   {:expected-checkpoint 42} {:expected-checkpont (random-uuid)}]]
+    (let [error (try (workspace/advance! nil nil options) nil (catch Exception e e))]
+      (is (= ::workspace/invalid-advance-options (:type (ex-data error)))))))
 
 (deftest advancing-refuses-an-intervening-worktree-edit
   (let [{:keys [cfg canonical] :as f} (fixture)]

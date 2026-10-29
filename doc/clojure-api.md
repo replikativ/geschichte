@@ -177,6 +177,27 @@ Payload bytes are intentionally store refs, not indexed inline values. Query
 metadata first and load bytes through `repo/read`, `repo/read-entry`, or Konserve
 blob access only when required.
 
+## Advancing an inspected workspace
+
+`workspace/advance!` imports a committed source tip into a clean target workspace
+and guards its captured target state inside the publication transaction. A host
+which inspected the target earlier can also pass its physical Datahike checkpoint:
+
+```clojure
+(workspace/advance! incoming target
+                    {:expected-checkpoint inspected-target-checkpoint})
+```
+
+Capture `inspected-target-checkpoint` with `d/commit-id` from the exact target DB
+that was reviewed. A mismatch refuses with `::workspace/stale-advance` before
+preparation or writes, including changes which preserve logical HEAD. The
+existing writer guard then protects that same captured DB until publication.
+Omitting the option retains ordinary advance behavior. An explicitly supplied
+token must be a UUID; unknown options and malformed tokens refuse with
+`::workspace/invalid-advance-options`. Only `:ref` and `:expected-checkpoint` are
+accepted. This precondition does not confer authority, retain history, or replace
+the host's store/room identity and lifetime checks.
+
 ## Atomic publication with application receipts
 
 `prepare-commit` captures one immutable repository DB after staging. It returns
