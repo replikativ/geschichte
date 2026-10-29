@@ -202,6 +202,12 @@
                     (+ cursor length)))
                 cursor)
               n (.inflate inflater output)]
+          ;; The declared size is an invariant throughout decoding, not merely
+          ;; an EOF check. Refuse before hashing or retaining an oversized chunk.
+          (when (> (+ total n) expected-size)
+            (throw (ex-info "Git pack object size mismatch"
+                            {:declared expected-size :actual (+ total n)
+                             :position position})))
           (when (pos? n)
             (when digest (.update ^MessageDigest digest output 0 n))
             (when out (.write ^ByteArrayOutputStream out output 0 n)))
@@ -388,7 +394,7 @@
     (.digest ^MessageDigest digest)))
 
 (defn- scan-primitive
-  [pack {:keys [object-format resolve-ref delta-cache-bytes max-pack-objects
+  [pack {:keys [object-format resolve-ref delta-cache-bytes
                 delta-frontier-bytes delta-spill-directory
                 max-pack-index-memory-bytes delta-parallelism phase-fn]
          :or {object-format :sha1 delta-cache-bytes (* 96 1024 1024)
@@ -396,9 +402,6 @@
               max-pack-index-memory-bytes (* 1024 1024 1024)
               delta-parallelism 4}}
    version object-count limit expected length]
-  (when (and max-pack-objects (> object-count max-pack-objects))
-    (throw (ex-info "Git pack exceeds configured object limit"
-                    {:objects object-count :limit max-pack-objects})))
   (let [estimated-index-bytes (* 58 (long object-count))]
     (when (and max-pack-index-memory-bytes
                (> estimated-index-bytes max-pack-index-memory-bytes))
@@ -1031,10 +1034,11 @@
 (defn scan
   "Validate and index a pack through positional reads. Inflated bodies are not
   retained. `:resolve-ref` may supply `{ :type keyword :payload bytes }` for a
-  thin-pack base."
+  thin-pack base. `:max-pack-objects` bounds object count before either indexer
+  allocates or decodes entries. It is not a bound on total decoded byte size."
   ([pack] (scan pack nil))
   ([pack {:keys [object-format resolve-ref delta-cache-bytes
-                 primitive-index-threshold phase-fn]
+                 primitive-index-threshold phase-fn max-pack-objects]
           :or {object-format :sha1 delta-cache-bytes (* 96 1024 1024)
                primitive-index-threshold 0}
           :as opts}]
@@ -1047,6 +1051,12 @@
      (let [buffer (doto (ByteBuffer/wrap header 4 8) (.order ByteOrder/BIG_ENDIAN))
            version (.getInt buffer)
            count (.getInt buffer)
+           _ (when (neg? count)
+               (throw (ex-info "Git pack object count exceeds supported range"
+                               {:objects (Integer/toUnsignedLong count)})))
+           _ (when (and max-pack-objects (> count max-pack-objects))
+               (throw (ex-info "Git pack exceeds configured object limit"
+                               {:objects count :limit max-pack-objects})))
            limit (- length checksum-size)
            expected (source/read-range pack limit checksum-size)
            checksum-start (phase-start phase-fn :verify-checksum
