@@ -1,7 +1,8 @@
 (ns geschichte.git.client
   "Transport-neutral Git client composition. HTTP, SSH, and local-process
   transports exchange request/response bytes at this boundary."
-  (:require [geschichte.git.checkout :as checkout]
+  (:require [geschichte.git.budget :as budget]
+            [geschichte.git.checkout :as checkout]
             [geschichte.git.object :as object]
             [geschichte.git.pack :as pack]
             [geschichte.git.project :as project]
@@ -15,6 +16,7 @@
   "Extract and import the pack from a protocol-v2 fetch response."
   ([conn response] (ingest-fetch! conn response nil))
   ([conn response opts]
+   (budget/charge! (:import-budget opts) :response-bytes (alength ^bytes response))
    (let [{:keys [pack progress]} (protocol/parse-fetch-response response)
          imported (store/import-pack! (or (:object-store opts) conn) pack opts)]
      (assoc imported :progress progress))))
@@ -26,7 +28,7 @@
    (store/import-pack-producer!
     (or (:object-store opts) conn)
     (fn [write!]
-      (protocol/consume-fetch-response! input write! opts))
+      (protocol/consume-fetch-response! (budget/input-stream input (:import-budget opts)) write! opts))
     opts)))
 
 (defn ingest-ls-refs!
@@ -68,7 +70,7 @@
   "Materialize the fetched HEAD (or `:oid`) as a local Geschichte branch."
   ([conn fetched] (checkout-fetched! conn fetched nil))
   ([conn fetched {:keys [oid ref force? branch object-format object-store
-                         history-materialization-limit]}]
+                         history-materialization-limit] :as opts}]
    (let [head (some #(when (= "HEAD" (:ref %)) %) (:refs fetched))
          branch-ref (when branch (str "refs/heads/" branch))
          branch-head (when branch-ref
@@ -83,13 +85,11 @@
      (when-not oid
        (throw (ex-info "Fetched repository has no checkout target"
                        {:refs (:refs fetched)})))
-     (assoc (checkout/materialize! conn oid {:ref ref :force? force?
-                                             :object-format (or object-format
-                                                                :sha1)
-                                             :object-store object-store
-                                             :history-materialization-limit
-                                             (or history-materialization-limit
-                                                 2048)})
+     (assoc (checkout/materialize! conn oid
+                                   (assoc opts :ref ref :force? force?
+                                          :object-format (or object-format :sha1)
+                                          :object-store object-store
+                                          :history-materialization-limit (or history-materialization-limit 2048)))
             :fetched fetched))))
 
 (defn- fetched-head [fetched branch]
@@ -101,23 +101,28 @@
         (some #(when (.startsWith ^String (:ref %) "refs/heads/") %)
               (:refs fetched)))))
 
-(defn- ensure-current-oid! [conn object-store commit]
+(defn- ensure-current-oid! [conn object-store commit opts]
   (or (:geschichte.commit/git-oid
        (repo/commit-by-id conn (:geschichte.commit/id commit)))
-      (let [graph (project/project conn (:geschichte.commit/id commit)
+      (let [_ (when (:import-budget opts)
+                (throw (ex-info "Budgeted pull requires an existing Git object identity for the local tip"
+                                {:type ::unsupported-local-projection})))
+            graph (project/project conn (:geschichte.commit/id commit)
                                    {:object-store object-store})]
         (store/persist-graph! (or object-store conn) graph)
         (:oid graph))))
 
 (defn- git-ancestor?
-  [conn object-store ancestor descendant]
+  [conn object-store ancestor descendant opts]
   (loop [pending [descendant] seen #{}]
+    (budget/check! (:import-budget opts))
     (if-let [oid (peek pending)]
       (cond
         (= oid ancestor) true
         (seen oid) (recur (pop pending) seen)
         :else
-        (let [metadata (store/read-object (or object-store conn) oid)]
+        (let [_ (budget/charge! (:import-budget opts) :commit-visits 1)
+              metadata (store/read-object (or object-store conn) oid opts)]
           (when-not (= :commit (:geschichte.git.object/type metadata))
             (throw (ex-info "Git ancestry requires a stored commit graph"
                             {:oid oid :type (:geschichte.git.object/type metadata)})))
@@ -133,7 +138,7 @@
   Ancestry is decided from exact Git objects before worktree mutation."
   ([conn remote fetched] (apply-pull! conn remote fetched nil))
   ([conn remote fetched {:keys [policy ref object-store branch]
-                         :or {policy :ff-only}}]
+                         :or {policy :ff-only} :as opts}]
    (when-not (:clean? (repo/status conn))
      (throw (ex-info "Pull requires a clean worktree and index"
                      {:pull/status :local-changes :status (repo/status conn)})))
@@ -145,21 +150,21 @@
      (when-not remote-oid
        (throw (ex-info "Fetched remote has no branch tip" {:remote remote})))
      (if-not current
-       (assoc (checkout-fetched! conn fetched {:oid remote-oid
-                                               :ref (or ref current-ref)})
+       (assoc (checkout-fetched! conn fetched (assoc opts :oid remote-oid
+                                                     :ref (or ref current-ref)))
               :pull/status :initialized)
-       (let [current-oid (ensure-current-oid! conn object-store current)]
+       (let [current-oid (ensure-current-oid! conn object-store current opts)]
          (cond
            (= current-oid remote-oid)
            {:pull/status :up-to-date :oid current-oid}
 
-           (git-ancestor? conn object-store current-oid remote-oid)
+           (git-ancestor? conn object-store current-oid remote-oid opts)
            (assoc (checkout/materialize! conn remote-oid
-                                         {:ref (or ref current-ref)})
+                                         (assoc opts :ref (or ref current-ref)))
                   :pull/status :fast-forward
                   :from current-oid :to remote-oid)
 
-           (git-ancestor? conn object-store remote-oid current-oid)
+           (git-ancestor? conn object-store remote-oid current-oid opts)
            {:pull/status :local-ahead :oid current-oid :remote remote-oid}
 
            (= policy :ff-only)
@@ -168,9 +173,12 @@
                             :policy policy :pull/status :diverged}))
 
            (= policy :merge)
-           (let [temporary-ref (str "refs/pull/" remote)
+           (let [_ (when (:import-budget opts)
+                     (throw (ex-info "Budgeted pull does not support divergent merge preparation"
+                                     {:type ::unsupported-merge-policy})))
+                 temporary-ref (str "refs/pull/" remote)
                  remote-commit
-                 (checkout/materialize! conn remote-oid {:ref temporary-ref})
+                 (checkout/materialize! conn remote-oid (assoc opts :ref temporary-ref))
                  remote-id (:commit remote-commit)]
              (repo/checkout! conn current-ref)
              (assoc (merge/prepare! conn current-id remote-id)

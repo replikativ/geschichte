@@ -1,6 +1,7 @@
 (ns geschichte.git.pack-read
   "Range-based Git pack-v2/v3 scanner and delta resolver."
-  (:require [geschichte.git.object :as object]
+  (:require [geschichte.git.budget :as budget]
+            [geschichte.git.object :as object]
             [geschichte.git.pack-index :as pack-index]
             [geschichte.git.pack-source :as source])
   (:import [java.io ByteArrayOutputStream File RandomAccessFile]
@@ -35,11 +36,24 @@
                        data)))
     duration-ms))
 
-(defn- future-value [^Future future]
-  (try
-    (.get future)
-    (catch ExecutionException error
-      (throw (.getCause error)))))
+(defn- worker-values
+  "Settle every decoder before its shared spill file/source may be closed.
+  A failed worker must not release storage underneath another running worker."
+  [workers]
+  (let [settled (mapv (fn [^Future worker]
+                        (loop [interrupted? false]
+                          (let [[kind value] (try [:value (.get worker)]
+                                                  (catch InterruptedException e [:interrupted e])
+                                                  (catch ExecutionException e [:error (.getCause e)]))]
+                            (if (= kind :interrupted) (recur true)
+                                {:kind kind :value value :interrupted? interrupted?}))))
+                      workers)]
+    (when (some :interrupted? settled) (.interrupt (Thread/currentThread)))
+    (if-let [failed (some #(when (= :error (:kind %)) %) settled)]
+      (throw (:value failed))
+      (if (some :interrupted? settled)
+        (throw (InterruptedException. "Interrupted while joining Git decoders"))
+        (mapv :value settled)))))
 
 (defn- digest-name [object-format]
   (case object-format :sha1 "SHA-1" :sha256 "SHA-256"
@@ -63,6 +77,8 @@
 
 (defn- read-size-varint [^bytes bytes position limit]
   (loop [position position shift 0 value 0]
+    (when (> shift 56)
+      (throw (ex-info "Git delta size exceeds supported signed-long range" {:position position})))
     (ensure-available! limit position 1 :delta-size)
     (let [byte (unsigned-byte bytes position)
           value (bit-or value (bit-shift-left (bit-and byte 0x7f) shift))]
@@ -72,66 +88,77 @@
 
 (defn apply-delta
   "Apply Git's byte-oriented COPY/INSERT delta instruction stream."
-  ^bytes [^bytes base ^bytes delta]
-  (let [limit (alength delta)
-        [base-size position] (read-size-varint delta 0 limit)
-        [result-size position] (read-size-varint delta position limit)]
-    (when-not (= base-size (alength base))
-      (throw (ex-info "Git delta base size mismatch"
-                      {:declared base-size :actual (alength base)})))
-    (let [out (ByteArrayOutputStream. result-size)]
-      (loop [position position]
-        (if (= position limit)
-          (let [result (.toByteArray out)]
-            (when-not (= result-size (alength result))
-              (throw (ex-info "Git delta result size mismatch"
-                              {:declared result-size :actual (alength result)})))
-            result)
-          (let [opcode (unsigned-byte delta position)
-                position (inc position)]
-            (cond
-              (zero? opcode)
-              (throw (ex-info "Reserved zero opcode in Git delta"
-                              {:position (dec position)}))
+  (^bytes [^bytes base ^bytes delta] (apply-delta base delta nil))
+  (^bytes [^bytes base ^bytes delta import-budget]
+   (let [limit (alength delta)
+         [base-size position] (read-size-varint delta 0 limit)
+         [result-size position] (read-size-varint delta position limit)]
+     (when-not (= base-size (alength base))
+       (throw (ex-info "Git delta base size mismatch"
+                       {:declared base-size :actual (alength base)})))
+     (budget/bound! import-budget :delta-result-bytes result-size)
+     (budget/bound! import-budget :object-bytes result-size)
+     (when (> result-size Integer/MAX_VALUE)
+       (throw (ex-info "Git delta result exceeds JVM byte-array range" {:declared result-size})))
+     (budget/charge! import-budget :reconstructed-bytes result-size)
+     (let [out (ByteArrayOutputStream. (int result-size))]
+       (loop [position position]
+         (budget/check! import-budget)
+         (if (= position limit)
+           (let [result (.toByteArray out)]
+             (when-not (= result-size (alength result))
+               (throw (ex-info "Git delta result size mismatch"
+                               {:declared result-size :actual (alength result)})))
+             result)
+           (let [opcode (unsigned-byte delta position)
+                 position (inc position)]
+             (cond
+               (zero? opcode)
+               (throw (ex-info "Reserved zero opcode in Git delta"
+                               {:position (dec position)}))
 
-              (zero? (bit-and opcode 0x80))
-              (do
-                (ensure-available! limit position opcode :delta-insert)
-                (.write out delta position opcode)
-                (recur (+ position opcode)))
+               (zero? (bit-and opcode 0x80))
+               (do
+                 (ensure-available! limit position opcode :delta-insert)
+                 (when (> opcode (- result-size (.size out)))
+                   (throw (ex-info "Git delta output exceeds declared size" {:declared result-size})))
+                 (.write out delta position opcode)
+                 (recur (+ position opcode)))
 
-              :else
-              (let [[offset position]
-                    (loop [bit 0x01 shift 0 value 0 position position]
-                      (if (> bit 0x08)
-                        [value position]
-                        (if (zero? (bit-and opcode bit))
-                          (recur (bit-shift-left bit 1) (+ shift 8)
-                                 value position)
-                          (do
-                            (ensure-available! limit position 1 :delta-copy-offset)
-                            (recur (bit-shift-left bit 1) (+ shift 8)
-                                   (bit-or value
-                                           (bit-shift-left
-                                            (unsigned-byte delta position) shift))
-                                   (inc position))))))
-                    [size position]
-                    (loop [bit 0x10 shift 0 value 0 position position]
-                      (if (> bit 0x40)
-                        [(if (zero? value) 0x10000 value) position]
-                        (if (zero? (bit-and opcode bit))
-                          (recur (bit-shift-left bit 1) (+ shift 8)
-                                 value position)
-                          (do
-                            (ensure-available! limit position 1 :delta-copy-size)
-                            (recur (bit-shift-left bit 1) (+ shift 8)
-                                   (bit-or value
-                                           (bit-shift-left
-                                            (unsigned-byte delta position) shift))
-                                   (inc position))))))]
-                (ensure-available! (alength base) offset size :delta-copy)
-                (.write out base offset size)
-                (recur position)))))))))
+               :else
+               (let [[offset position]
+                     (loop [bit 0x01 shift 0 value 0 position position]
+                       (if (> bit 0x08)
+                         [value position]
+                         (if (zero? (bit-and opcode bit))
+                           (recur (bit-shift-left bit 1) (+ shift 8)
+                                  value position)
+                           (do
+                             (ensure-available! limit position 1 :delta-copy-offset)
+                             (recur (bit-shift-left bit 1) (+ shift 8)
+                                    (bit-or value
+                                            (bit-shift-left
+                                             (unsigned-byte delta position) shift))
+                                    (inc position))))))
+                     [size position]
+                     (loop [bit 0x10 shift 0 value 0 position position]
+                       (if (> bit 0x40)
+                         [(if (zero? value) 0x10000 value) position]
+                         (if (zero? (bit-and opcode bit))
+                           (recur (bit-shift-left bit 1) (+ shift 8)
+                                  value position)
+                           (do
+                             (ensure-available! limit position 1 :delta-copy-size)
+                             (recur (bit-shift-left bit 1) (+ shift 8)
+                                    (bit-or value
+                                            (bit-shift-left
+                                             (unsigned-byte delta position) shift))
+                                    (inc position))))))]
+                 (ensure-available! (alength base) offset size :delta-copy)
+                 (when (> size (- result-size (.size out)))
+                   (throw (ex-info "Git delta output exceeds declared size" {:declared result-size})))
+                 (.write out base offset size)
+                 (recur position))))))))))
 
 (defn- entry-prefix [pack offset limit object-format]
   (let [available (int (min 80 (- limit offset)))
@@ -182,70 +209,76 @@
      :data-offset (+ offset position)}))
 
 (defn- inflate-at
-  [pack position limit expected-size retain? digest]
-  (let [inflater (Inflater.)
-        input-size (* 64 1024)
-        output (byte-array (* 64 1024))
-        out (when retain? (ByteArrayOutputStream. (int (min expected-size 1048576))))]
-    (try
-      (loop [cursor (long position) total 0]
-        (let [cursor
-              (if (.needsInput inflater)
-                (do
-                  (when (>= cursor limit)
-                    (throw (ex-info "Truncated Git pack zlib stream"
-                                    {:position position})))
-                  (let [{:keys [bytes offset length]}
-                        (source/read-window pack cursor
-                                            (min input-size (- limit cursor)))]
-                    (.setInput inflater ^bytes bytes (int offset) (int length))
-                    (+ cursor length)))
-                cursor)
-              n (.inflate inflater output)]
+  ([pack position limit expected-size retain? digest]
+   (inflate-at pack position limit expected-size retain? digest nil))
+  ([pack position limit expected-size retain? digest import-budget]
+   (budget/bound! import-budget :object-bytes expected-size)
+   (let [inflater (Inflater.)
+         input-size (* 64 1024)
+         output (byte-array (* 64 1024))
+         out (when retain? (ByteArrayOutputStream. (int (min expected-size 1048576))))]
+     (try
+       (loop [cursor (long position) total 0]
+         (budget/check! import-budget)
+         (let [cursor
+               (if (.needsInput inflater)
+                 (do
+                   (when (>= cursor limit)
+                     (throw (ex-info "Truncated Git pack zlib stream"
+                                     {:position position})))
+                   (let [{:keys [bytes offset length]}
+                         (source/read-window pack cursor
+                                             (min input-size (- limit cursor)))]
+                     (.setInput inflater ^bytes bytes (int offset) (int length))
+                     (+ cursor length)))
+                 cursor)
+               n (.inflate inflater output)]
           ;; The declared size is an invariant throughout decoding, not merely
           ;; an EOF check. Refuse before hashing or retaining an oversized chunk.
-          (when (> (+ total n) expected-size)
-            (throw (ex-info "Git pack object size mismatch"
-                            {:declared expected-size :actual (+ total n)
-                             :position position})))
-          (when (pos? n)
-            (when digest (.update ^MessageDigest digest output 0 n))
-            (when out (.write ^ByteArrayOutputStream out output 0 n)))
-          (let [total (+ total n)]
-            (cond
-              (.finished inflater)
-              (do
-                (when-not (= expected-size total)
-                  (throw (ex-info "Git pack object size mismatch"
-                                  {:declared expected-size :actual total
-                                   :position position})))
-                {:payload (when out (.toByteArray ^ByteArrayOutputStream out))
-                 :end (- cursor (.getRemaining inflater))})
+           (when (> (+ total n) expected-size)
+             (throw (ex-info "Git pack object size mismatch"
+                             {:declared expected-size :actual (+ total n)
+                              :position position})))
+           (when (pos? n)
+             (budget/charge! import-budget :inflated-bytes n)
+             (when digest (.update ^MessageDigest digest output 0 n))
+             (when out (.write ^ByteArrayOutputStream out output 0 n)))
+           (let [total (+ total n)]
+             (cond
+               (.finished inflater)
+               (do
+                 (when-not (= expected-size total)
+                   (throw (ex-info "Git pack object size mismatch"
+                                   {:declared expected-size :actual total
+                                    :position position})))
+                 {:payload (when out (.toByteArray ^ByteArrayOutputStream out))
+                  :end (- cursor (.getRemaining inflater))})
 
-              (.needsDictionary inflater)
-              (throw (ex-info "Git pack zlib stream needs a dictionary"
-                              {:position position}))
+               (.needsDictionary inflater)
+               (throw (ex-info "Git pack zlib stream needs a dictionary"
+                               {:position position}))
 
-              (and (zero? n) (.needsInput inflater))
-              (recur (long cursor) total)
+               (and (zero? n) (.needsInput inflater))
+               (recur (long cursor) total)
 
-              (zero? n)
-              (throw (ex-info "Stalled Git pack zlib stream"
-                              {:position position}))
+               (zero? n)
+               (throw (ex-info "Stalled Git pack zlib stream"
+                               {:position position}))
 
-              :else (recur (long cursor) total)))))
-      (catch DataFormatException error
-        (throw (ex-info "Invalid Git pack zlib stream"
-                        {:position position} error)))
-      (finally (.end inflater)))))
+               :else (recur (long cursor) total)))))
+       (catch DataFormatException error
+         (throw (ex-info "Invalid Git pack zlib stream"
+                         {:position position} error)))
+       (finally (.end inflater))))))
 
 (defn- object-digest [object-format type size]
   (doto (MessageDigest/getInstance (digest-name object-format))
     (.update ^bytes (object/utf8 (str (name type) " " size "\u0000")))))
 
-(defn- digest-range [pack start end object-format]
+(defn- digest-range [pack start end object-format import-budget]
   (let [digest (MessageDigest/getInstance (digest-name object-format))]
     (loop [position (long start)]
+      (budget/check! import-budget)
       (if (= position end)
         (.digest digest)
         (let [length (int (min (* 1024 1024) (- end position)))
@@ -394,7 +427,7 @@
     (.digest ^MessageDigest digest)))
 
 (defn- scan-primitive
-  [pack {:keys [object-format resolve-ref delta-cache-bytes
+  [pack {:keys [object-format resolve-ref resolve-ref-context import-depth import-budget delta-cache-bytes
                 delta-frontier-bytes delta-spill-directory
                 max-pack-index-memory-bytes delta-parallelism phase-fn]
          :or {object-format :sha1 delta-cache-bytes (* 96 1024 1024)
@@ -403,6 +436,7 @@
               delta-parallelism 4}}
    version object-count limit expected length]
   (let [estimated-index-bytes (* 58 (long object-count))]
+    (budget/bound! import-budget :index-bytes estimated-index-bytes)
     (when (and max-pack-index-memory-bytes
                (> estimated-index-bytes max-pack-index-memory-bytes))
       (throw (ex-info "Git pack compact-index workspace exceeds configured memory budget"
@@ -447,7 +481,7 @@
                     object-type (when (<= code 4) storage-type)
                     digest (when object-type
                              (object-digest object-format object-type size))
-                    inflated (inflate-at pack data-offset limit size false digest)
+                    inflated (inflate-at pack data-offset limit size false digest import-budget)
                     end (long (:end inflated))]
                 (aset-long offsets index (long position))
                 (aset-byte storage-types index (unchecked-byte code))
@@ -619,7 +653,7 @@
                                             limit object-format)
                               payload (:payload
                                        (inflate-at pack data-offset limit size
-                                                   true nil))]
+                                                   true nil import-budget))]
                           (retain! base-index payload)))))
 
                 (release-base! [base-index]
@@ -702,8 +736,8 @@
                                     delta
                                     (:payload
                                      (inflate-at pack data-offset limit
-                                                 size true nil))
-                                    payload (apply-delta base delta)]
+                                                 size true nil import-budget))
+                                    payload (apply-delta base delta import-budget)]
                                 {:object-index object-index
                                  :base-index base-index
                                  :type-code type-code
@@ -740,6 +774,8 @@
                             results))
 
                         (process-chain! [head depth]
+                          (when (not= -1 head)
+                            (budget/bound! import-budget :delta-depth (inc depth)))
                           (loop [cursor head resolved-count 0]
                             (if (= -1 cursor)
                               resolved-count
@@ -788,6 +824,7 @@
                                        (+ resolved-count completed))))))
 
                         (process-object-children! [object-index depth]
+                          (budget/bound! import-budget :delta-depth depth)
                           (when (> depth 128)
                             (throw
                              (ex-info "Git pack delta chain is too deep"
@@ -805,6 +842,8 @@
                             (+ ofs-count ref-count)))
 
                         (process-external-chain! [head base depth]
+                          (when (not= -1 head)
+                            (budget/bound! import-budget :delta-depth (inc depth)))
                           (loop [cursor head resolved-count 0]
                             (if (= -1 cursor)
                               resolved-count
@@ -842,7 +881,9 @@
                                                   keys (* ref-index oid-size)
                                                   (* (inc ref-index) oid-size)))
                                             base (when resolve-ref
-                                                   (resolve-ref oid))]
+                                                   (if resolve-ref-context
+                                                     (resolve-ref-context oid 1)
+                                                     (resolve-ref oid)))]
                                         (when-not base
                                           (throw
                                            (ex-info
@@ -852,7 +893,7 @@
                                          (inc slot)
                                          (+ resolved-count
                                             (process-external-chain!
-                                             head base 0)))))))))))
+                                             head base (:delta-depth base 0))))))))))))
 
                         (process-roots! []
                           (loop [resolved-count 0]
@@ -878,7 +919,7 @@
                                        (reify Callable
                                          (call [_] (process-roots!)))))
                                     (range parallelism))]
-                               (reduce + (map future-value workers)))
+                               (reduce + (worker-values workers)))
                              (process-roots!))
                            (process-external-bases!))
                         unresolved
@@ -945,11 +986,11 @@
                 (.delete file)))))))))
 
 (defn- resolve-entries
-  [pack entries limit object-format resolve-ref cache-bytes]
+  [pack entries limit object-format resolve-ref cache-bytes import-budget resolve-ref-context]
   (let [by-offset (into {} (map (juxt :offset identity)) entries)
         resolved (atom (into {}
                              (keep (fn [{:keys [offset oid type]}]
-                                     (when oid [offset {:oid oid :type type}])))
+                                     (when oid [offset {:oid oid :type type :delta-depth 0}])))
                              entries))
         oid-offset (atom (into {}
                                (keep (fn [{:keys [offset oid]}]
@@ -957,11 +998,20 @@
                                entries))
         external (atom {})
         cache (byte-cache cache-bytes)]
-    (letfn [(materialize [offset depth]
+    (letfn [(external-base [oid depth]
+              (let [value (or (get @external oid)
+                              (when resolve-ref
+                                (if resolve-ref-context (resolve-ref-context oid depth) (resolve-ref oid))))]
+                (when value
+                  (budget/bound! import-budget :delta-depth (+ depth (:delta-depth value 0)))
+                  (swap! external assoc oid value))
+                value))
+            (materialize [offset depth]
+              (budget/bound! import-budget :delta-depth depth)
               (when (> depth 64)
                 (throw (ex-info "Git pack delta chain is too deep"
                                 {:offset offset :max-depth 64})))
-              (or (cache-value cache offset)
+              (or (when-not import-budget (cache-value cache offset))
                   (let [{:keys [storage-type base data-offset size] :as entry}
                         (get by-offset offset)
                         result
@@ -972,16 +1022,13 @@
                                   :ref-delta
                                   (if-let [base-offset (get @oid-offset (:oid base))]
                                     (materialize base-offset (inc depth))
-                                    (or (:payload (get @external (:oid base)))
-                                        (some-> (when resolve-ref
-                                                  (resolve-ref (:oid base)))
-                                                :payload)
+                                    (or (:payload (external-base (:oid base) (inc depth)))
                                         (throw (ex-info "Missing Git REF_DELTA base"
                                                         {:offset offset :base base})))))]
                             (apply-delta base-value
                                          (:payload (inflate-at pack data-offset limit
-                                                               size true nil))))
-                          (:payload (inflate-at pack data-offset limit size true nil)))]
+                                                               size true nil import-budget)) import-budget))
+                          (:payload (inflate-at pack data-offset limit size true nil import-budget)))]
                     (cache-put! cache offset result))))
 
             (resolve-entry [entry]
@@ -992,27 +1039,25 @@
                       :ref-delta
                       (or (when-let [base-offset (get @oid-offset (:oid base))]
                             (get @resolved base-offset))
-                          (get @external (:oid base))
-                          (when resolve-ref
-                            (when-let [resolved-base (resolve-ref (:oid base))]
-                              (swap! external assoc (:oid base) resolved-base)
-                              resolved-base)))
+                          (external-base (:oid base) 1))
                       nil)]
                 (when (or (not (#{:ofs-delta :ref-delta} storage-type)) base-info)
                   (if-not (#{:ofs-delta :ref-delta} storage-type)
                     (get @resolved offset)
-                    (let [base-value
+                    (let [result-depth (inc (:delta-depth base-info 0))
+                          _ (budget/bound! import-budget :delta-depth result-depth)
+                          base-value
                           (if-let [base-offset (and (= storage-type :ofs-delta)
                                                     (:offset base))]
                             (materialize base-offset 0)
                             (if-let [internal-offset (get @oid-offset (:oid base))]
                               (materialize internal-offset 0)
                               (:payload base-info)))
-                          delta (:payload (inflate-at pack data-offset limit size true nil))
-                          payload (apply-delta base-value delta)
+                          delta (:payload (inflate-at pack data-offset limit size true nil import-budget))
+                          payload (apply-delta base-value delta import-budget)
                           type (:type base-info)
                           oid (object/object-id object-format type payload)
-                          info {:oid oid :type type}]
+                          info {:oid oid :type type :delta-depth result-depth}]
                       (swap! resolved assoc offset info)
                       (swap! oid-offset assoc oid offset)
                       (cache-put! cache offset payload)
@@ -1038,10 +1083,11 @@
   allocates or decodes entries. It is not a bound on total decoded byte size."
   ([pack] (scan pack nil))
   ([pack {:keys [object-format resolve-ref delta-cache-bytes
-                 primitive-index-threshold phase-fn max-pack-objects]
+                 primitive-index-threshold phase-fn max-pack-objects import-budget resolve-ref-context]
           :or {object-format :sha1 delta-cache-bytes (* 96 1024 1024)
                primitive-index-threshold 0}
           :as opts}]
+   (budget/check! import-budget)
    (let [length (source/source-size pack)
          checksum-size (checksum-length object-format)
          _ (ensure-available! length 0 (+ 12 checksum-size) :pack-envelope)
@@ -1057,11 +1103,13 @@
            _ (when (and max-pack-objects (> count max-pack-objects))
                (throw (ex-info "Git pack exceeds configured object limit"
                                {:objects count :limit max-pack-objects})))
+           _ (budget/charge! import-budget :objects count)
+           _ (budget/bound! import-budget :index-bytes (* 58 (long count)))
            limit (- length checksum-size)
            expected (source/read-range pack limit checksum-size)
            checksum-start (phase-start phase-fn :verify-checksum
                                        {:pack-bytes length :objects count})
-           actual (digest-range pack 0 limit object-format)
+           actual (digest-range pack 0 limit object-format import-budget)
            checksum-ms (phase-complete phase-fn :verify-checksum checksum-start
                                        {:pack-bytes length :objects count})]
        (when-not (#{2 3} version)
@@ -1083,7 +1131,7 @@
                                        {:position position :limit limit})))
                      (let [resolved
                            (resolve-entries pack entries limit object-format
-                                            resolve-ref delta-cache-bytes)]
+                                            resolve-ref delta-cache-bytes import-budget resolve-ref-context)]
                        {:version version :count count
                         :size length
                         :checksum (object/bytes->hex expected)
@@ -1098,7 +1146,7 @@
                          digest (when object-type
                                   (object-digest object-format object-type size))
                          inflated
-                         (inflate-at pack data-offset limit size false digest)
+                         (inflate-at pack data-offset limit size false digest import-budget)
                          entry
                          (cond-> (assoc entry :end (:end inflated))
                            object-type
@@ -1112,32 +1160,39 @@
 
 (defn resolve-at
   "Resolve one object at a stored pack offset with bounded caller cache."
-  [pack offset {:keys [object-format resolve-ref max-depth cache cache-bytes]
+  [pack offset {:keys [object-format resolve-ref max-depth cache cache-bytes import-budget resolve-ref-context import-depth]
                 :or {object-format :sha1 max-depth 64
                      cache-bytes (* 96 1024 1024)}}]
   (let [limit (- (source/source-size pack) (checksum-length object-format))
         cache (or cache (resolution-cache cache-bytes))]
     (letfn [(resolve-offset [offset depth]
+              (budget/bound! import-budget :delta-depth depth)
               (when (> depth max-depth)
                 (throw (ex-info "Git pack delta chain is too deep"
                                 {:offset offset :max-depth max-depth})))
-              (or (cache-value cache offset)
+              (or (when-not import-budget (cache-value cache offset))
                   (let [{:keys [storage-type base data-offset size]}
                         (entry-prefix pack offset limit object-format)
                         base-value
                         (case storage-type
                           :ofs-delta (resolve-offset (:offset base) (inc depth))
                           :ref-delta
-                          (or (when resolve-ref (resolve-ref (:oid base)))
+                          (or (when resolve-ref
+                                (if resolve-ref-context
+                                  (resolve-ref-context (:oid base) (inc depth))
+                                  (resolve-ref (:oid base))))
                               (throw (ex-info "Missing Git REF_DELTA base"
                                               {:offset offset :base base})))
                           nil)
+                        result-depth (if base-value (inc (:delta-depth base-value 0)) 0)
+                        _ (budget/bound! import-budget :delta-depth (+ (or import-depth 0) result-depth))
                         delta-or-payload
-                        (:payload (inflate-at pack data-offset limit size true nil))
-                        result {:type (if base-value (:type base-value) storage-type)
+                        (:payload (inflate-at pack data-offset limit size true nil import-budget))
+                        result {:delta-depth result-depth
+                                :type (if base-value (:type base-value) storage-type)
                                 :payload (if base-value
                                            (apply-delta (:payload base-value)
-                                                        delta-or-payload)
+                                                        delta-or-payload import-budget)
                                            delta-or-payload)}]
                     (cache-put! cache offset result))))]
-      (resolve-offset (long offset) 0))))
+      (resolve-offset (long offset) (or import-depth 0)))))

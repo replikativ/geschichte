@@ -1,11 +1,18 @@
 (ns geschichte.git.ssh
   "Stateful Git process transport used for SSH and local upload-pack validation."
   (:require [geschichte.git.client :as client]
+            [geschichte.git.budget :as budget]
             [geschichte.git.pkt-line :as pkt]
             [geschichte.git.protocol-v2 :as protocol]
             [geschichte.git.receive-pack :as receive]
             [geschichte.git.store :as store])
   (:import [java.io InputStream]))
+
+(defn- refuse-budget! [opts]
+  (when (:import-budget opts)
+    (budget/check! (:import-budget opts))
+    (throw (ex-info "Budgeted Git imports require HTTPS; process transport is not bounded"
+                    {:type ::unsupported-import-budget}))))
 
 (defn- shell-quote [value]
   (str "'" (.replace ^String (str value) "'" "'\\''") "'"))
@@ -82,6 +89,7 @@
   ([conn remote argv-fn {:keys [prefixes haves]
                          :or {prefixes ["HEAD" "refs/heads/" "refs/tags/"]}
                          :as opts}]
+   (refuse-budget! opts)
    (let [probe (session! argv-fn "git-upload-pack"
                          (protocol/ls-refs-request {:prefixes prefixes}))
          capabilities (protocol/parse-advertisement (:advertisement probe))
@@ -106,7 +114,8 @@
 (defn ls-remote!
   "Discover refs over SSH/local upload-pack without persisting or fetching."
   [argv-fn {:keys [prefixes haves]
-            :or {prefixes ["HEAD" "refs/heads/" "refs/tags/"]}}]
+            :or {prefixes ["HEAD" "refs/heads/" "refs/tags/"]} :as opts}]
+  (refuse-budget! opts)
   (let [probe (session! argv-fn "git-upload-pack"
                         (protocol/ls-refs-request {:prefixes prefixes}))]
     (protocol/parse-ls-refs (:response probe))))
@@ -114,6 +123,7 @@
 (defn push!
   "Push one Geschichte commit over stateful receive-pack."
   [conn commit-id argv-fn {:keys [ref] :as opts}]
+  (refuse-budget! opts)
   (let [prepared (atom nil)
         session
         (session-with!

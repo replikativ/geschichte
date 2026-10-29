@@ -2,6 +2,7 @@
   "Persistence boundary for exact Git objects in a Geschichte database."
   (:require [datahike.api :as d]
             [datahike.gc-guard :as guard]
+            [geschichte.git.budget :as budget]
             [geschichte.git.cache :as cache]
             [geschichte.git.pack :as pack]
             [geschichte.git.pack-index :as pack-index]
@@ -152,45 +153,63 @@
 
 (declare read-object*)
 
-(defn- read-object* [store oid]
-  (when-let [metadata (or (object-in-packs store (known-packs store) oid)
-                          (object-in-packs store (refresh-packs! store) oid))]
-    (let [pack (:geschichte.git.object/pack metadata)
-          {pack-source :source resolution :objects} (cached-pack store pack)
-          resolved
-          (try
-            (pack-read/resolve-at
-             pack-source (:geschichte.git.object/offset metadata)
-             {:object-format (:geschichte.git.pack/object-format pack)
-              :cache resolution
-              :resolve-ref
-              (fn [base-oid]
-                (when-let [base (read-object* store base-oid)]
-                  {:type (:geschichte.git.object/type base)
-                   :payload (:payload base)}))})
-            (catch clojure.lang.ExceptionInfo error
-              (throw
-               (ex-info
-                (ex-message error)
-                (merge (ex-data error)
-                       {:oid oid
-                        :indexed-offset (:geschichte.git.object/offset metadata)
-                        :pack-id (:geschichte.git.pack/id pack)})
-                error))))]
-      (when-not (= (:geschichte.git.object/type metadata) (:type resolved))
-        (throw (ex-info "Packed Git object type mismatch"
+(defn- read-object*
+  ([store oid] (read-object* store oid nil))
+  ([store oid opts]
+   (budget/check! (:import-budget opts))
+   (when (contains? (:import-seen opts #{}) oid)
+     (throw (ex-info "Cyclic external Git delta base" {:oid oid})))
+   (when-let [metadata (or (object-in-packs store (known-packs store) oid)
+                           (object-in-packs store (refresh-packs! store) oid))]
+     (let [pack (:geschichte.git.object/pack metadata)
+           {pack-source :source resolution :objects} (cached-pack store pack)
+           resolved
+           (try
+             (pack-read/resolve-at
+              pack-source (:geschichte.git.object/offset metadata)
+              {:object-format (:geschichte.git.pack/object-format pack)
+               :import-budget (:import-budget opts)
+               :import-depth (:import-depth opts 0)
+               :cache (when-not (:import-budget opts) resolution)
+               :resolve-ref-context
+               (fn [base-oid depth]
+                 (when-let [base (read-object* store base-oid
+                                               (assoc opts :import-depth depth
+                                                      :import-seen (conj (:import-seen opts #{}) oid)))]
+                   {:type (:geschichte.git.object/type base)
+                    :delta-depth (:delta-depth base 0)
+                    :payload (:payload base)}))
+               :resolve-ref
+               (fn [base-oid]
+                 (when-let [base (read-object* store base-oid)]
+                   {:type (:geschichte.git.object/type base)
+                    :payload (:payload base)}))})
+             (catch clojure.lang.ExceptionInfo error
+               (throw
+                (ex-info
+                 (ex-message error)
+                 (merge (ex-data error)
                         {:oid oid
-                         :expected (:geschichte.git.object/type metadata)
-                         :actual (:type resolved)})))
-      (assoc metadata :payload (:payload resolved)))))
+                         :indexed-offset (:geschichte.git.object/offset metadata)
+                         :pack-id (:geschichte.git.pack/id pack)})
+                 error))))]
+       (when-not (= (:geschichte.git.object/type metadata) (:type resolved))
+         (throw (ex-info "Packed Git object type mismatch"
+                         {:oid oid
+                          :expected (:geschichte.git.object/type metadata)
+                          :actual (:type resolved)})))
+       (budget/bound! (:import-budget opts) :object-bytes (alength ^bytes (:payload resolved)))
+       (assoc metadata :payload (:payload resolved) :delta-depth (:delta-depth resolved 0))))))
 
 (defn read-object
   "Return exact Git object metadata with its lazily resolved payload."
-  [store-or-conn oid]
-  (with-store store-or-conn #(read-object* % oid)))
+  ([store-or-conn oid] (read-object store-or-conn oid nil))
+  ([store-or-conn oid opts]
+   (with-store store-or-conn #(read-object* % oid opts))))
 
-(defn read-payload [store-or-conn oid]
-  (:payload (read-object store-or-conn oid)))
+(defn read-payload
+  ([store-or-conn oid] (read-payload store-or-conn oid nil))
+  ([store-or-conn oid opts] (:payload (read-object store-or-conn oid opts))))
 
 (defn- existing-oids [store]
   (into #{}
@@ -247,10 +266,13 @@
           (project conn commit-id
                    (assoc (or opts {}) :object-store object-store))))))))
 
-(defn- stored-base [store oid]
-  (when-let [metadata (read-object* store oid)]
-    {:type (:geschichte.git.object/type metadata)
-     :payload (:payload metadata)}))
+(defn- stored-base
+  ([store oid] (stored-base store oid nil))
+  ([store oid opts]
+   (when-let [metadata (read-object* store oid opts)]
+     {:type (:geschichte.git.object/type metadata)
+      :delta-depth (:delta-depth metadata 0)
+      :payload (:payload metadata)})))
 
 (defn- ref-tx-data [remote refs]
   (mapv (fn [{:keys [oid ref attributes]}]
@@ -348,6 +370,7 @@
                     :geschichte.git.pack/object-format object-format}])
         refs-tx (when (and remote (seq refs)) (ref-tx-data remote refs))
         tx-data (into (vec pack-tx) refs-tx)]
+    (budget/check! (:import-budget opts))
     (when (seq tx-data) (d/transact conn tx-data))
     (when-not duplicate? (reset! (:manifest store) nil))
     (if duplicate? 0 (:count indexed))))
@@ -364,6 +387,7 @@
    (with-store
      store-or-conn
      (fn [store]
+       (budget/check! (:import-budget opts))
        (let [opts (or opts {})
              conn (:conn store)
              object-format (:object-format opts :sha1)
@@ -384,7 +408,10 @@
                                          {:pack-bytes (:size descriptor)})
                  indexed (pack-read/scan
                           source
-                          (assoc opts :resolve-ref #(stored-base store %)))
+                          (assoc opts
+                                 :resolve-ref #(stored-base store % opts)
+                                 :resolve-ref-context (fn [oid depth]
+                                                        (stored-base store oid (assoc opts :import-depth depth)))))
                  scan-ms (phase-complete phase-fn :scan-pack scan-start
                                          {:pack-bytes (:size descriptor)
                                           :objects (:count indexed)})

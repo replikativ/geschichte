@@ -2,13 +2,14 @@
   "Lazy materialization of imported Git commits into Geschichte snapshots."
   (:require [clojure.string :as str]
             [datahike.api :as d]
+            [geschichte.git.budget :as budget]
             [geschichte.git.object :as object]
             [geschichte.git.store :as store]
             [geschichte.repo :as repo])
   (:import [java.util Arrays Date UUID]))
 
-(defn- stored-object [object-store oid expected-type]
-  (let [metadata (or (store/read-object object-store oid)
+(defn- stored-object [object-store oid expected-type opts]
+  (let [metadata (or (store/read-object object-store oid opts)
                      (throw (ex-info "Missing imported Git object" {:oid oid})))
         type (:geschichte.git.object/type metadata)]
     (when-not (= expected-type type)
@@ -33,22 +34,24 @@
                       (assoc data :reason :non-utf8))))))
 
 (defn- tree-files
-  ([object-store tree-oid object-format]
-   (tree-files object-store "" tree-oid object-format))
-  ([object-store prefix tree-oid object-format]
+  ([object-store tree-oid object-format opts]
+   (tree-files object-store "" tree-oid object-format opts 0))
+  ([object-store prefix tree-oid object-format opts depth]
+   (budget/bound! (:import-budget opts) :tree-depth depth)
    (mapcat
     (fn [{:keys [mode name oid] :as entry}]
+      (budget/charge! (:import-budget opts) :tree-entries 1)
       (let [_ (validate-entry-name! prefix entry)
             path (if (str/blank? prefix) name (str prefix "/" name))]
         (case mode
-          "40000" (tree-files object-store path oid object-format)
-          "040000" (tree-files object-store path oid object-format)
-          "160000" (throw (ex-info "Gitlinks require submodule policy"
-                                   {:path path :oid oid}))
-          [[path {:bytes (stored-object object-store oid :blob)
-                  :mode (mode-long mode)}]])))
+          ("40000" "040000") (tree-files object-store path oid object-format opts (inc depth))
+          "160000" (throw (ex-info "Gitlinks require submodule policy" {:path path :oid oid}))
+          (let [_ (budget/charge! (:import-budget opts) :checkout-files 1)
+                bytes (stored-object object-store oid :blob opts)]
+            (budget/charge! (:import-budget opts) :checkout-bytes (alength ^bytes bytes))
+            [[path {:bytes bytes :mode (mode-long mode)}]]))))
     (object/parse-tree object-format
-                       (stored-object object-store tree-oid :tree)))))
+                       (stored-object object-store tree-oid :tree opts)))))
 
 (defn- logical-ids [conn oids]
   (let [existing
@@ -71,23 +74,26 @@
     {:identity identity :time (Date. (* 1000 (Long/parseLong seconds)))}
     {:identity (or person "unknown") :time (Date. 0)}))
 
-(defn- commit-graph [object-store root-oid limit]
+(defn- commit-graph [object-store root-oid limit opts]
   (loop [pending [root-oid] seen #{} commits {} frontier #{}]
+    (budget/check! (:import-budget opts))
     (if-let [oid (peek pending)]
-      (cond
-        (seen oid)
-        (recur (pop pending) seen commits frontier)
+      (do
+        (budget/charge! (:import-budget opts) :commit-visits 1)
+        (cond
+          (seen oid)
+          (recur (pop pending) seen commits frontier)
 
-        (>= (count commits) limit)
-        (recur (pop pending) (conj seen oid) commits (conj frontier oid))
+          (>= (count commits) limit)
+          (recur (pop pending) (conj seen oid) commits (conj frontier oid))
 
-        :else
-        (let [parsed (object/parse-commit
-                      (stored-object object-store oid :commit))]
-          (recur (into (pop pending) (:parents parsed))
-                 (conj seen oid)
-                 (assoc commits oid parsed)
-                 frontier)))
+          :else
+          (let [parsed (object/parse-commit
+                        (stored-object object-store oid :commit opts))]
+            (recur (into (pop pending) (:parents parsed))
+                   (conj seen oid)
+                   (assoc commits oid parsed)
+                   frontier))))
       {:commits commits :frontier frontier})))
 
 (defn materialize!
@@ -98,17 +104,18 @@
   ([conn oid {:keys [ref force? object-format object-store
                      history-materialization-limit]
               :or {ref "refs/heads/imported" object-format :sha1
-                   history-materialization-limit 2048}}]
+                   history-materialization-limit 2048}
+              :as opts}]
    (store/with-store
      (or object-store conn)
      (fn [object-store]
        (let [{:keys [commits frontier]}
-             (commit-graph object-store oid history-materialization-limit)
+             (commit-graph object-store oid history-materialization-limit opts)
              id-by-oid (logical-ids conn (into (set (keys commits)) frontier))
              selected (get commits oid)
              file-count (volatile! 0)
              files (map (fn [entry] (vswap! file-count inc) entry)
-                        (tree-files object-store (:tree selected) object-format))
+                        (tree-files object-store (:tree selected) object-format opts))
              snapshot (repo/materialize-bytes! conn files {:force? force?})
              commit-tx
              (into
@@ -141,6 +148,7 @@
      ;; Nested unique-identity maps upsert parent entities inside this same
      ;; transaction. Unlike lookup refs, they do not require an intermediate DB
      ;; state where identities exist but the graph/ref publication is incomplete.
+         (budget/check! (:import-budget opts))
          (d/transact conn
                      (into commit-tx
                            [{:geschichte.ref/name ref

@@ -105,6 +105,11 @@ materialization starts may leave partial private preparation; it must not be
 advertised as a published sync or replayed blindly. No push authorization is
 implied by fetching or successfully applying an incoming update.
 
+JVM HTTPS imports can share an explicit operation-local `:import-budget` across
+discovery, pack ingestion, checkout and lazy reconstruction. See
+[Git import budgets](git-import-budgets.md) for counter units, cooperative
+deadline/cancellation, supported transports and the private-publication contract.
+
 ## Filesystem API
 
 ```clojure
