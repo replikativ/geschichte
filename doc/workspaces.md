@@ -33,6 +33,27 @@ uncommitted files, staging state, or unrelated refs. Advance is explicit and
 requires a clean target. Discard removes the physical Datahike branch; unreachable
 payloads become eligible for garbage collection.
 
+### Advance invariants
+
+`advance!` observes one immutable canonical snapshot and updates only the target's
+checked-out logical ref. It refuses pending merges and a different explicit
+`:ref`; check out that branch first. Non-conflicting untracked files remain
+untouched, while tracked files and the index become the selected committed tree.
+
+Preparation does not write. The target's repository identity, physical workspace,
+checkpoint, transaction number, refs, index and worktree are checked again inside
+the serialized merge transaction, before any transfer or materialization datoms
+are applied. Any intervening target transaction refuses with
+`:geschichte.workspace/stale-advance`. The concurrent state remains intact;
+callers must inspect it and prepare again rather than replay stale changes.
+
+The source may advance independently: the returned `:canonical-commit`, imported
+tree and retained merge ancestry all refer to the same captured source snapshot.
+This operation does not promise the newest source state at completion. Callers
+must keep both repositories and the captured history alive throughout the
+operation; the prepared state is not a GC lease. Git transport pull/checkout has
+its own exclusive-connection contract and does not acquire these guarantees.
+
 The optional Yggdrasil adapter maps fork/merge/discard onto this model and lets
 Geschichte participate in Spindel execution contexts.
 
