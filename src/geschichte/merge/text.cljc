@@ -68,6 +68,25 @@
   [a b]
   (and (<= (:start a) (:end b)) (<= (:start b) (:end a))))
 
+(defn- overlap-cluster [ours theirs]
+  (let [start (min (:start (first ours)) (:start (first theirs)))]
+    (loop [end (max (:end (first ours)) (:end (first theirs)))
+           o ours t theirs os [] ts []]
+      (cond
+        (and (seq o) (<= (:start (first o)) end))
+        (recur (max end (:end (first o))) (rest o) t (conj os (first o)) ts)
+
+        (and (seq t) (<= (:start (first t)) end))
+        (recur (max end (:end (first t))) o (rest t) os (conj ts (first t)))
+
+        :else {:start start :end end :ours os :theirs ts :o o :t t}))))
+
+(defn- render-cluster [base start end replacements]
+  (loop [pos start edits (seq replacements) out []]
+    (if-let [{:keys [start end lines]} (first edits)]
+      (recur end (next edits) (into (into out (subvec base pos start)) lines))
+      (into out (subvec base pos end)))))
+
 (defn merge-lines
   "Three-way merge of line vectors. Returns
 
@@ -92,21 +111,15 @@
 
           ;; both sides touch the same region
           (and oh th (overlaps? oh th))
-          (let [start (min (:start oh) (:start th))
-                end (max (:end oh) (:end th))]
-            (if (= (:lines oh) (:lines th))
-              ;; the SAME edit made twice is not a conflict — two agents told to
-              ;; do one thing both doing it is the expected case, not a clash
-              (recur end (rest o) (rest t)
-                     (into (into out (subvec base pos start)) (:lines oh))
-                     conflicts)
-              (recur end (rest o) (rest t)
-                     (into (into out (subvec base pos start)) (:lines oh))
-                     (conj conflicts
-                           {:base (subvec base (min start (count base))
-                                          (min end (count base)))
-                            :ours (:lines oh)
-                            :theirs (:lines th)}))))
+          (let [{:keys [start end ours theirs o t]} (overlap-cluster o t)
+                ours (render-cluster base start end ours)
+                theirs (render-cluster base start end theirs)
+                out (into (into out (subvec base pos start)) ours)]
+            (recur end o t out
+                   (if (= ours theirs)
+                     conflicts
+                     (conj conflicts {:base (subvec base start end)
+                                      :ours ours :theirs theirs}))))
 
           ;; only ours, or ours comes first
           (and oh (or (nil? th) (< (:start oh) (:start th))))
