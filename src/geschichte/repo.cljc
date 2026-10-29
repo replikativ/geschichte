@@ -91,7 +91,8 @@
   (d/q '[:find (pull ?ref [:db/id :geschichte.ref/name
                            {:geschichte.ref/target
                             [:db/id :geschichte.commit/id
-                             :geschichte.commit/snapshot]}]) .
+                             :geschichte.commit/snapshot
+                             {:geschichte.commit/parents [:geschichte.commit/id]}]}]) .
          :in $ ?name
          :where [?ref :geschichte.ref/name ?name]]
        db ref-name))
@@ -416,8 +417,9 @@
   "Publish the current staging index as a logical Geschichte commit.
 
   With `:amend? true`, replace the current ref tip while retaining the
-  amended commit's parents. The old commit remains addressable by ID, matching
-  Git's immutable-object model and making reflog support possible later."
+  amended commit's parents. Pending merges cannot be amended. The old commit
+  remains addressable by ID, matching Git's immutable-object model and making
+  reflog support possible later."
   [conn {:keys [message author time amend?]
          :or {author "unknown"}}]
   (platform-async
@@ -425,6 +427,9 @@
      (throw (ex-info "Commit message must not be blank" {})))
    (let [head (head-commit conn)
          second-parent (merge-parent conn)
+         _ (when (and amend? second-parent)
+             (throw (ex-info "Cannot amend while a merge is pending"
+                             {:type ::amend-during-merge})))
          head-tree (await (head-map conn))
          index (stage-map @conn)]
      (when (and (= head-tree index) (nil? second-parent) (not amend?))

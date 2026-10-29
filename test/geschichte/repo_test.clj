@@ -20,6 +20,27 @@
   (d/release conn)
   (d/delete-database cfg))
 
+(deftest amend-preserves-root-and-linear-topology
+  (let [{:keys [conn] :as f} (fixture)]
+    (try
+      (repo/init! conn)
+      (repo/write! conn "a.txt" (->bytes "one\n"))
+      (repo/stage-all! conn)
+      (let [root (:geschichte.commit/id (repo/commit! conn {:message "root"}))
+            amended-root (:geschichte.commit/id (repo/commit! conn {:message "root amended" :amend? true}))]
+        (is (empty? (:geschichte.commit/parents (repo/commit-by-id conn amended-root))))
+        (is (= "one\n" (text (repo/read-at conn root "a.txt"))))
+        (repo/write! conn "a.txt" (->bytes "two\n"))
+        (repo/stage-all! conn)
+        (let [second (:geschichte.commit/id (repo/commit! conn {:message "second"}))
+              amended (:geschichte.commit/id (repo/commit! conn {:message "second amended" :amend? true}))]
+          (is (= #{amended-root}
+                 (set (map :geschichte.commit/id (:geschichte.commit/parents (repo/commit-by-id conn amended))))))
+          (is (= [amended amended-root] (mapv :geschichte.commit/id (repo/log conn))))
+          (is (= "two\n" (text (repo/read-at conn second "a.txt"))))
+          (is (= "two\n" (text (repo/read-at conn amended "a.txt"))))))
+      (finally (cleanup f)))))
+
 (deftest init-write-stage-commit-status
   (let [{:keys [conn] :as f} (fixture)]
     (try

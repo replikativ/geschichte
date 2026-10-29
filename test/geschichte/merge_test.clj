@@ -35,12 +35,22 @@
               (is (= #{"a" "b"} (set (keys (:tree clean)))))
 
               (merge/prepare! conn main feature)
+              (let [before @conn
+                    failure (try (repo/commit! conn {:message "Cannot amend during merge" :amend? true})
+                                 nil (catch Exception error error))]
+                (is (= :geschichte.repo/amend-during-merge (:type (ex-data failure))))
+                (is (= before @conn)))
               (let [merged (repo/commit! conn {:message "merge feature"})
                     parents (:geschichte.commit/parents
                              (repo/commit-by-id conn
                                                 (:geschichte.commit/id merged)))]
                 (is (= #{main feature}
-                       (set (map :geschichte.commit/id parents)))))
+                       (set (map :geschichte.commit/id parents))))
+                (let [amended (repo/commit! conn {:message "merge amended" :amend? true})]
+                  (is (= #{main feature}
+                         (set (map :geschichte.commit/id
+                                   (:geschichte.commit/parents
+                                    (repo/commit-by-id conn (:geschichte.commit/id amended)))))))))
 
               (repo/checkout! conn "feature")
               (repo/write! conn "b" (utf8 "feature b conflict\n"))
