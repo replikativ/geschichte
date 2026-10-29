@@ -12,6 +12,7 @@
             [geschichte.git-pkt-line-test]
             [geschichte.git-wire-test]
             [geschichte.merge-core-test]
+            [geschichte.merge.whitespace-test]
             [geschichte.query-node-test]
             [geschichte.repo-node-test]
             [geschichte.tree-test]
@@ -37,6 +38,7 @@
                   'geschichte.git-pkt-line-test
                   'geschichte.git-wire-test
                   'geschichte.merge-core-test
+                  'geschichte.merge.whitespace-test
                   'geschichte.query-node-test
                   'geschichte.repo-node-test
                   'geschichte.tree-test
