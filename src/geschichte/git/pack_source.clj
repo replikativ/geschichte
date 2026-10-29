@@ -4,7 +4,8 @@
   Packs are stored as ordered, content-addressed chunks. Readers request only
   the chunks intersecting a byte range; the exact original pack stream remains
   reconstructible without a second whole-pack payload."
-  (:require [geschichte.git.cache :as cache]
+  (:require [geschichte.git.budget :as budget]
+            [geschichte.git.cache :as cache]
             [geschichte.store.blob :as blob])
   (:import [java.util Arrays]))
 
@@ -135,6 +136,7 @@
   transacted."
   ([conn] (streaming-sink conn nil))
   ([conn opts]
+   (budget/check! (:import-budget opts))
    (let [chunk-size (long (or (:pack-chunk-size opts) default-chunk-size))
          _ (when-not (and (pos? chunk-size) (<= chunk-size Integer/MAX_VALUE))
              (throw (ex-info "Invalid Git pack chunk size"
@@ -165,6 +167,7 @@
          (fn write!
            ([value] (write! value 0 (alength ^bytes value)))
            ([^bytes value source-offset length]
+            (budget/charge! (:import-budget opts) :pack-bytes length)
             (when (:finished? @state)
               (throw (ex-info "Cannot write a finished Git pack sink" {})))
             (loop [source-offset (int source-offset) remaining (int length)]
@@ -179,6 +182,7 @@
                   (recur (+ source-offset n) (- remaining n)))))))
          finish!
          (fn []
+           (budget/check! (:import-budget opts))
            (when (:finished? @state)
              (throw (ex-info "Git pack sink is already finished" {})))
            (publish!)

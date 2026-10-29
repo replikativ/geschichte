@@ -3,6 +3,7 @@
   (:require [clojure.string :as str]
             [datahike.api :as d]
             [geschichte.repo :as repo]
+            [geschichte.git.budget :as budget]
             [geschichte.git.http :as http]
             [geschichte.git.ssh :as ssh])
   (:import [java.net URI]))
@@ -95,6 +96,7 @@
                  branch (assoc (str "branch." branch ".remote") remote
                                (str "branch." branch ".merge")
                                source-ref))]
+    (budget/check! (:import-budget options))
     (d/transact conn (mapv (fn [[key value]]
                              {:geschichte.config/key key
                               :geschichte.config/value value}) config))
