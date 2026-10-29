@@ -12,7 +12,7 @@
   (:import [java.io ByteArrayInputStream FilterInputStream IOException InputStream]
            [java.net URI]
            [java.time Duration]
-           [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers
+           [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse
             HttpResponse$BodyHandlers HttpTimeoutException]
            [java.util.concurrent ExecutionException Executors ExecutorService ThreadFactory TimeUnit TimeoutException]
            [java.util.concurrent.atomic AtomicBoolean AtomicLong]))
@@ -116,7 +116,7 @@
                 (try (when (.compareAndSet closed false true) (.close body))
                      (finally (join-watchdog! executor))))))))
 
-(defn- send-native! [request operation]
+(defn- send-native! ^HttpResponse [request operation]
   (let [pending (.sendAsync ^HttpClient @http-client request (HttpResponse$BodyHandlers/ofInputStream))]
     (try
       (loop []
@@ -130,7 +130,7 @@
         ;; to close. Otherwise cancellation aborts the default client's request.
         (when-not (.cancel pending true)
           (try
-            (when-let [response (.getNow pending nil)] (.close ^InputStream (.body response)))
+            (when-let [^HttpResponse response (.getNow pending nil)] (.close ^InputStream (.body response)))
             (catch Exception _ nil)))
         (when (instance? InterruptedException error) (.interrupt (Thread/currentThread)))
         (let [cause (if (instance? ExecutionException error) (.getCause error) error)]
