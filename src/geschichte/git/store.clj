@@ -93,11 +93,32 @@
 (defn- store-id [conn]
   (:id (:store (:config @conn))))
 
+(defn metadata-budget-policy
+  "Finite pack lookup admission limits. Merge into the caller's shared import
+  policy; omitted counters in legacy partial policies remain unbounded."
+  ([] (metadata-budget-policy 30000))
+  ([timeout-ms]
+   {:timeout-ms timeout-ms
+    :limits {:pack-visits 4096 :pack-metadata-parts 1000000
+             :index-bytes (* 16 1024 1024) :index-read-bytes (* 128 1024 1024)}}))
+
+(defn- captured-packs
+  "Admit pack and child metadata before pulling it. A bounded lookup scans
+  lazily against one captured catalog and never builds a full manifest."
+  [db operation]
+  (letfn [(step [rows]
+            (lazy-seq
+             (when-let [rows (seq rows)]
+               (budget/charge! operation :pack-visits 1)
+               (let [eid (:e (first rows))]
+                 (doseq [attribute [:geschichte.git.pack/chunks :geschichte.git.pack/index-shards]
+                         _ (d/datoms db :eavt eid attribute)]
+                   (budget/charge! operation :pack-metadata-parts 1))
+                 (cons (d/pull db pack-selector eid) (step (rest rows)))))))]
+    (step (d/datoms db :avet :geschichte.git.pack/id))))
+
 (defn- refresh-packs! [{:keys [conn manifest]}]
-  (let [packs (mapv #(d/pull @conn pack-selector %)
-                    (d/q '[:find [?pack ...]
-                           :where [?pack :geschichte.git.pack/id]]
-                         @conn))]
+  (let [packs (vec (captured-packs @conn nil))]
     (reset! manifest packs)
     packs))
 
@@ -119,19 +140,30 @@
 (defn- oid-prefix [oid]
   (Integer/parseInt (subs oid 0 1) 16))
 
-(defn- index-shard [store pack prefix]
+(defn- index-shard [store pack prefix operation]
   (when-let [shard (some #(when (= prefix (:geschichte.git.index/prefix %)) %)
                          (:geschichte.git.pack/index-shards pack))]
     (let [{:keys [conn cache]} store
           payload-id (:geschichte.git.index/payload shard)
+          _ (budget/check! operation)
+          loaded? (volatile! false)
           bytes (cache/chunk!
                  cache [(store-id conn) :index payload-id]
-                 #(payload/get-bytes conn payload-id))]
+                 #(do (vreset! loaded? true)
+                      (payload/get-bytes conn payload-id
+                                         {:merge-budget operation :byte-limit-metric :index-bytes
+                                          :read-metric :index-read-bytes})))]
+      ;; Charge actual bytes even on a warm cache hit; cache capacity is not
+      ;; an operation limit. The bounded payload reader also checks each read.
+      (when-not @loaded? (budget/charge! operation :index-read-bytes (alength ^bytes bytes)))
+      (budget/check! operation)
+      (budget/bound! operation :index-bytes (alength ^bytes bytes))
+      (budget/check! operation)
       (pack-index/open bytes))))
 
-(defn- object-in-packs [store packs oid]
+(defn- object-in-packs [store packs oid operation]
   (some (fn [pack]
-          (when-let [index (index-shard store pack (oid-prefix oid))]
+          (when-let [index (index-shard store pack (oid-prefix oid) operation)]
             (when-let [{:keys [type offset]} (pack-index/lookup index oid)]
               {:geschichte.git.object/oid oid
                :geschichte.git.object/type type
@@ -146,10 +178,10 @@
   (with-store
     store-or-conn
     (fn [store]
-      (or (object-in-packs store (known-packs store) oid)
+      (or (object-in-packs store (known-packs store) oid nil)
          ;; A peer may have published another pack since this handle populated
          ;; its manifest. A miss is the inexpensive invalidation boundary.
-          (object-in-packs store (refresh-packs! store) oid)))))
+          (object-in-packs store (refresh-packs! store) oid nil)))))
 
 (declare read-object*)
 
@@ -159,8 +191,13 @@
    (budget/check! (:import-budget opts))
    (when (contains? (:import-seen opts #{}) oid)
      (throw (ex-info "Cyclic external Git delta base" {:oid oid})))
-   (when-let [metadata (or (object-in-packs store (known-packs store) oid)
-                           (object-in-packs store (refresh-packs! store) oid))]
+   (when-let [metadata (if-let [operation (:import-budget opts)]
+                         ;; One exact immutable catalog, one admitted scan,
+                         ;; including misses; no eager full manifest or retry.
+                         (let [db @(:conn store)]
+                           (object-in-packs store (captured-packs db operation) oid operation))
+                         (or (object-in-packs store (known-packs store) oid nil)
+                             (object-in-packs store (refresh-packs! store) oid nil)))]
      (let [pack (:geschichte.git.object/pack metadata)
            {pack-source :source resolution :objects} (cached-pack store pack)
            resolved
@@ -217,7 +254,7 @@
                   (mapcat (fn [{:geschichte.git.index/keys [prefix]}]
                             (map :oid
                                  (pack-index/entries
-                                  (index-shard store pack prefix))))
+                                  (index-shard store pack prefix nil))))
                           (:geschichte.git.pack/index-shards pack))))
         (known-packs store)))
 

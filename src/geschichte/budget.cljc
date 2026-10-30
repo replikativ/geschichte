@@ -5,6 +5,7 @@
 
 (def ^:private cumulative
   #{:response-bytes :pack-bytes :objects :inflated-bytes :reconstructed-bytes
+    :pack-visits :pack-metadata-parts :index-read-bytes
     :commit-visits :tree-entries :checkout-files :checkout-bytes
     :graph-edges :tree-path-bytes :tree-bytes :result-tree-bytes :content-visits :content-parts
     :content-read-bytes :content-decoded-bytes :text-lines :text-work

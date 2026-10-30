@@ -108,33 +108,33 @@
                                 (conj ids (await (put! conn value opts))))
                          ids))))))))
 
-(defn- account-read! [operation size]
-  (budget/bound! operation :object-bytes size)
-  (budget/charge! operation :content-read-bytes size))
+(defn- account-read! [{:keys [merge-budget byte-limit-metric read-metric]} size]
+  (budget/bound! merge-budget (or byte-limit-metric :object-bytes) size)
+  (budget/charge! merge-budget (or read-metric :content-read-bytes) size))
 
 #?(:clj
-   (defn- bounded-stream [^InputStream input operation]
+   (defn- bounded-stream [^InputStream input {:keys [merge-budget byte-limit-metric read-metric] :as opts}]
      (let [scratch (byte-array 8192)
            output (ByteArrayOutputStream.)]
        (loop [size 0]
-         (budget/check! operation)
+         (budget/check! merge-budget)
          (let [n (.read input scratch)]
-           (budget/check! operation)
+           (budget/check! merge-budget)
            (if (neg? n)
              (.toByteArray output)
-             (do (budget/bound! operation :object-bytes (+ size n))
-                 (budget/charge! operation :content-read-bytes n)
+             (do (budget/bound! merge-budget (or byte-limit-metric :object-bytes) (+ size n))
+                 (budget/charge! merge-budget (or read-metric :content-read-bytes) n)
                  (.write output scratch 0 n)
                  (recur (+ size n)))))))))
 
 #?(:clj
-   (defn- sync-binary [{:keys [input-stream blob] :as value} operation]
+   (defn- sync-binary [{:keys [input-stream blob] :as value} {:keys [merge-budget] :as opts}]
      (cond
-       (bytes/byte-buffer? value) (do (account-read! operation (bytes/length value)) value)
-       (bytes/byte-buffer? input-stream) (do (account-read! operation (bytes/length input-stream)) input-stream)
-       input-stream (if operation (bounded-stream input-stream operation)
+       (bytes/byte-buffer? value) (do (account-read! opts (bytes/length value)) value)
+       (bytes/byte-buffer? input-stream) (do (account-read! opts (bytes/length input-stream)) input-stream)
+       input-stream (if merge-budget (bounded-stream input-stream opts)
                         (.readAllBytes ^java.io.InputStream input-stream))
-       (bytes/byte-buffer? blob) (do (account-read! operation (bytes/length blob)) blob)
+       (bytes/byte-buffer? blob) (do (account-read! opts (bytes/length blob)) blob)
        :else (throw (ex-info "Unsupported Konserve binary value"
                              {:value-type (type value)})))))
 
@@ -159,14 +159,14 @@
        out)))
 
 #?(:cljs
-   (defn- async-binary [{:keys [input-stream blob] :as value} operation]
+   (defn- async-binary [{:keys [input-stream blob] :as value} {:keys [merge-budget] :as opts}]
      (try
        (cond
-         (bytes/byte-buffer? value) (do (account-read! operation (bytes/length value)) (value-channel value))
-         (bytes/byte-buffer? input-stream) (do (account-read! operation (bytes/length input-stream)) (value-channel input-stream))
-         (bytes/byte-buffer? blob) (do (account-read! operation (bytes/length blob)) (value-channel blob))
-         input-stream (if operation
-                        (budget/unsupported! operation :node-borrowed-stream)
+         (bytes/byte-buffer? value) (do (account-read! opts (bytes/length value)) (value-channel value))
+         (bytes/byte-buffer? input-stream) (do (account-read! opts (bytes/length input-stream)) (value-channel input-stream))
+         (bytes/byte-buffer? blob) (do (account-read! opts (bytes/length blob)) (value-channel blob))
+         input-stream (if merge-budget
+                        (budget/unsupported! merge-budget :node-borrowed-stream)
                         (stream-channel input-stream))
          :else (value-channel
                 (ex-info "Unsupported Konserve binary value"
@@ -187,7 +187,7 @@
                     (await
                      (execution/io-result
                       (k/bget (:store (or (:read-db opts) @conn)) id
-                              #?(:clj #(sync-binary % (:merge-budget opts))
-                                 :cljs #(async-binary % (:merge-budget opts)))
-                              (dissoc opts :merge-budget :read-db :content-seen :content-depth))
+                              #?(:clj #(sync-binary % opts)
+                                 :cljs #(async-binary % opts))
+                              (dissoc opts :merge-budget :read-db :content-seen :content-depth :byte-limit-metric :read-metric))
                       opts))))))))

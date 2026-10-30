@@ -126,3 +126,22 @@ successful live Memory/sync. The host owns cleanup and must separately validate
 authority, source/target versions and the completed result before guarded
 publication to a live repository. Direct pull into a concurrently edited live
 Memory remains unsupported.
+
+## Pack metadata lookup admission
+
+`geschichte.git.store/metadata-budget-policy` supplies additive finite limits for
+`:pack-visits`, `:pack-metadata-parts`, `:index-bytes`, and `:index-read-bytes`.
+Merge these limits into the shared import operation policy when bounding lazy
+object lookup. Legacy partial policies still leave omitted dimensions unbounded.
+A bounded object lookup scans one captured catalog lazily, admitting each pack
+and its chunk/shard references before pulling metadata. It avoids the ordinary
+ObjectStore's full manifest and refresh scan. Missing objects consume the scan
+budget too. This is a finite scan/refusal contract, not indexed pack membership.
+
+Index payload reads check size and cumulative bytes before accumulating stream
+buffers. Warm cache hits charge the same admitted index bytes; cache capacity
+does not bound operation work. Deadlines remain cooperative around backend
+calls, and limits are not a hard backend heap quota. Requested OID-to-logical-ID
+mapping uses per-OID indexed queries on one captured catalog and continues to
+prefer existing authored UUIDs. Hold graph/object input constant and increase
+unrelated packs to exercise cold/warm admission and missing-object refusal.
