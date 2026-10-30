@@ -105,7 +105,9 @@ physical cancellation and teardown where those guarantees are needed.
 Budgeted SSH/process transport explicitly refuses before launching a process;
 it currently lacks bounded process I/O/teardown. Import budgets do not bound Git
 push/export or divergent merge preparation; those paths explicitly refuse a
-budget rather than silently dropping it. A budgeted pull also refuses local
+budget rather than silently dropping it. Separate opt-in APIs now provide
+[bounded incremental push](bounded-push.md) and [bounded merge planning](bounded-merge.md);
+these do not change the legacy import-budget API's contract. A budgeted pull also refuses local
 Git projection when the current logical commit has no existing Git object ID.
 Fast-forward synchronization of imported Git histories is supported.
 
