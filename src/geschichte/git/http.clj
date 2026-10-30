@@ -246,6 +246,7 @@
   reachable object graph the caller already holds. It is not inferred from
   advertised refs or a partially materialized history."
   ([conn remote url] (fetch! send-http conn remote url nil))
+  ([conn remote url opts] (fetch! send-http conn remote url opts))
   ([send-fn conn remote url {:keys [prefixes haves]
                              :or {prefixes ["HEAD" "refs/heads/" "refs/tags/"]}
                              :as opts}]

@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [datahike.api :as d]
             [geschichte.git.http :as http]
+            [geschichte.git.transport :as transport]
             [geschichte.git.client :as client]
             [geschichte.git.project :as project]
             [geschichte.git.object :as object]
@@ -69,6 +70,16 @@
           (is (= 1 (:persisted result)))
           (is (= 3 (count @calls)))
           (is (= oid (get-in result [:refs 0 :oid]))))
+        ;; The default transport invokes HTTP's options-bearing convenience
+        ;; arity. Previously that arity was missing and real fetches failed.
+        (reset! calls [])
+        (let [result (with-redefs [http/send-http send-fn]
+                       (transport/fetch! {:conn conn :remote "origin" :url "https://example.test/repo.git"
+                                          :options {:haves [oid] :tags :none}}))]
+          (is (= oid (get-in result [:refs 0 :oid])))
+          (is (= 3 (count @calls)))
+          (is (some #(= (str "have " oid "\n") (when (bytes? %) (pkt/text %)))
+                    (pkt/decode (:body (last @calls))))))
         (finally
           (d/release conn)
           (d/delete-database cfg))))))

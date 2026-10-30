@@ -80,6 +80,10 @@ path ambiguity diagnostics matching Git.
 - The outbound pack writer is valid but undeltified; imported packs support Git
   COPY/INSERT deltas.
 
+Hosts that need bounded, explicitly admitted incremental export can use the
+opt-in JVM [bounded push API](bounded-push.md). It keeps publication intent and
+permissions with the host and refuses unsupported history reconstruction.
+
 ## Systematic deepening order
 
 1. Expand the differential scenario harness beyond revision selection to
