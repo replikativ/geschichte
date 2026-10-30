@@ -69,3 +69,17 @@
         (is (= (valid? (keys union)) (:clean? plan)))
         (is (valid? (keys (:tree plan))))
         (when (:clean? plan) (is (= union (:tree plan))))))))
+
+(deftest shortcut-parents-characterize-the-distance-policy
+  ;; B descends from A, so Git's best-common-ancestor antichain is {B}.
+  ;; Redundant shortcut edges make the documented distance policy select A.
+  ;; Keep this visible until a separate policy/version decision is made.
+  (let [parents {:a [] :b [:a] :o1 [:b] :t1 [:b]
+                 :ours [:o1 :a] :theirs [:t1 :a]}
+        ours (merge/ancestor-distances parents :ours)
+        theirs (merge/ancestor-distances parents :theirs)]
+    (is (= 2 (+ (ours :a) (theirs :a))))
+    (is (= 4 (+ (ours :b) (theirs :b))))
+    (is (= :a (merge/merge-base parents :ours :theirs)))
+    (is (= :a (merge/merge-base #(reverse (parents %)) :ours :theirs)))
+    (is (contains? (merge/ancestor-distances parents :b) :a))))
