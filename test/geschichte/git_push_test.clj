@@ -180,15 +180,24 @@
   (let [prepared {:version 1 :projection push/projection :ref "refs/heads/main"
                   :old (apply str (repeat 40 "a")) :new (apply str (repeat 40 "b"))
                   :pack (byte-array 0) :capabilities ["report-status"]}]
-    (doseq [unpack-lf ["" "\n"] status-lf ["" "\n"] status [:pushed :rejected]]
+    (doseq [unpack-lf ["" "\n"] status-lf ["" "\n"] status [:pushed :rejected] flushes [1 2]]
       (let [line (if (= :pushed status) "ok refs/heads/main" "ng refs/heads/main rejected")
-            sender (constantly {:status 200 :body (pkt/encode [(str "unpack ok" unpack-lf)
-                                                               (str line status-lf) :flush])})]
+            sender (constantly {:status 200 :body (pkt/encode (concat [(str "unpack ok" unpack-lf)
+                                                                       (str line status-lf)]
+                                                                      (repeat flushes :flush)))})]
         (is (= status (:status (push/send-http! sender "https://example.test/repo.git" prepared (op)))))))
+    (is (= :pushed
+           (:status (push/send-http!
+                     ;; Exact 45-byte response captured from the explicitly
+                     ;; approved disposable GitHub diagnostic push.
+                     (constantly {:status 200 :body (object/utf8 "000eunpack ok\n0017ok refs/heads/main\n00000000")})
+                     "https://example.test/repo.git" prepared (op)))))
     (doseq [report [["unpack ok" "ok refs/heads/main" "ok refs/heads/main" :flush]
                     ["unpack ok" "ok refs/heads/other" :flush]
                     ["unpack ok" "ok refs/heads/main"]
-                    ["unpack ok" "ok refs/heads/main" :flush :flush]
+                    ["unpack ok" "ok refs/heads/main" :flush :flush :flush]
+                    ["unpack ok" :flush "ok refs/heads/main" :flush]
+                    ["unpack ok" "ok refs/heads/main" :flush "ok refs/heads/other"]
                     ["unpack ok\n\n" "ok refs/heads/main" :flush]
                     ["unpack ok" "ok refs/heads/main\n\n" :flush]
                     ["unpack ok" "ok refs/heads/main " :flush]

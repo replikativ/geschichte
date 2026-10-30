@@ -243,7 +243,10 @@
         response (http/rpc! send-fn url "git-receive-pack" request {:import-budget op})
         frames (pkt/decode response)
         report (receive/parse-report response)]
-    (when-not (and (= 3 (count frames)) (= :flush (last frames))
+    (when-not (and (#{3 4} (count frames))
+                   ;; GitHub adds a second terminal flush to its HTTP result.
+                   ;; Permit only that bounded empty trailer, never more data.
+                   (every? #{:flush} (drop 2 frames))
                    (every? bytes? (take 2 frames))
                    ;; Non-binary pkt-lines permit an optional final LF. Strip
                    ;; that single byte only; whitespace and report shape remain
