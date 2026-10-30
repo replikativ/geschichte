@@ -340,6 +340,42 @@
     (let [error (try (workspace/advance! nil nil options) nil (catch Exception e e))]
       (is (= ::workspace/invalid-advance-options (:type (ex-data error)))))))
 
+(deftest raced-advance-refuses-before-projecting-the-writers-new-basis
+  (is (= {:id ::workspace/guarded-advance :version 1 :checkpoint-before-projection? true}
+         (workspace/advance-profile)))
+  (let [{:keys [cfg canonical] :as f} (fixture)]
+    (try
+      (workspace/fork! canonical "bounded-observer")
+      (let [observer (d/connect (assoc cfg :branch :geschichte.workspace/bounded-observer))
+            merge-var #'workspace/merge-data merge-data @merge-var
+            basis-var #'workspace/advance-basis advance-basis @basis-var
+            raced (atom nil) forbidden-calls (atom 0)]
+        (try
+          (repo/write! canonical "incoming.txt" (->bytes "incoming\n"))
+          (repo/stage-all! canonical)
+          (repo/commit! canonical {:message "Incoming"})
+          (let [expected (d/commit-id @observer)
+                failure (with-redefs-fn
+                          {merge-var (fn [conn parents tx]
+                                       (repo/set-config! observer "test.concurrent" "preserve")
+                                       (reset! raced @observer)
+                                       (merge-data conn parents tx))
+                           basis-var (fn [db]
+                                       (when (= (d/commit-id db) (some-> @raced d/commit-id))
+                                         (swap! forbidden-calls inc)
+                                         (throw (AssertionError. "Raced basis must not be projected")))
+                                       (advance-basis db))}
+                          #(try (workspace/advance! canonical observer {:expected-checkpoint expected})
+                                nil (catch Exception e e)))]
+            (is (= ::workspace/stale-advance (:type (ex-data failure))))
+            (is (= expected (:expected-checkpoint (ex-data failure))))
+            (is (= (d/commit-id @raced) (:actual-checkpoint (ex-data failure))))
+            (is (zero? @forbidden-calls))
+            (is (= @raced @observer))
+            (is (nil? (repo/read observer "incoming.txt"))))
+          (finally (d/release observer))))
+      (finally (cleanup f)))))
+
 (deftest advancing-refuses-an-intervening-worktree-edit
   (let [{:keys [cfg canonical] :as f} (fixture)]
     (try

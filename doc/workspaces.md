@@ -83,6 +83,13 @@ are applied. Any intervening target transaction refuses with
 `:geschichte.workspace/stale-advance`. The concurrent state remains intact;
 callers must inspect it and prepare again rather than replay stale changes.
 
+The serialized guard checks the native checkpoint before enumerating the new
+target's refs, index or worktree. Thus a caller that preflights finite bounds on
+an exact target cannot accidentally project a larger raced target in the writer.
+Pass `:expected-checkpoint` to bind that inspected target on entry too. The
+positive `advance-profile` marker advertises this checkpoint-first behavior;
+it does not make native projection budgeted or supply source exclusivity.
+
 The source may advance independently: the returned `:canonical-commit`, imported
 tree and retained merge ancestry all refer to the same captured source snapshot.
 This operation does not promise the newest source state at completion. Callers

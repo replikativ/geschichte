@@ -485,10 +485,23 @@
    :worktree (query/worktree db)})
 
 (defn- guarded-advance-tx [db basis tx-data]
+  ;; Refuse a raced snapshot before enumerating its index/worktree. The old
+  ;; complete-basis comparison already required this same checkpoint equality.
+  (when-not (= (:checkpoint basis) (d/commit-id db))
+    (throw (ex-info "Workspace changed while preparing advance"
+                    {:type ::stale-advance :ref (:ref basis)
+                     :expected-checkpoint (:checkpoint basis)
+                     :actual-checkpoint (d/commit-id db)})))
   (when-not (= basis (advance-basis db))
     (throw (ex-info "Workspace changed while preparing advance"
                     {:type ::stale-advance :ref (:ref basis)})))
   tx-data)
+
+(defn advance-profile
+  "Positive marker for finite preflight callers: a raced destination refuses
+   before full basis projection in the serialized writer as well as on entry."
+  []
+  {:id ::guarded-advance :version 1 :checkpoint-before-projection? true})
 
 (defn advance!
   "Fast-forward a clean workspace ref to the corresponding canonical ref.
