@@ -697,27 +697,45 @@
     (content/consume-by-id!
      conn id #(.write output ^bytes % 0 (alength ^bytes %)))))
 
-(defn- streaming-binary-patch [conn before after]
+(defn- streaming-binary-patch [left-conn right-conn before after]
   (binary-patch/patch-streaming
-   (long (or (:size before) 0)) #(write-entry! conn before %)
-   (long (or (:size after) 0)) #(write-entry! conn after %)))
+   (long (or (:size before) 0)) #(write-entry! left-conn before %)
+   (long (or (:size after) 0)) #(write-entry! right-conn after %)))
+
+(defn- source-changes [conn left right]
+  (let [left-view (repo/source-view conn left)
+        right-view (repo/source-view conn right)]
+    (->> (sort (set/union (set (keys (:tree left-view))) (set (keys (:tree right-view)))))
+         (keep (fn [path]
+                 (let [before (get (:tree left-view) path)
+                       after (get (:tree right-view) path)]
+                   (when (not= before after)
+                     {:path path :before before :after after
+                      :kind (cond (nil? before) :added (nil? after) :deleted :else :modified)
+                      :before-db (:db left-view) :after-db (:db right-view)}))))
+         vec)))
+
+(defn- entry-conn [conn change side]
+  (if-let [db (get change (case side :before :before-db :after :after-db))]
+    (atom db)
+    conn))
 
 (defn- render-file-diff
   ([conn change] (render-file-diff conn 3 change))
-  ([conn context {:keys [path old-path before after kind similarity]}]
-   (render-file-diff conn context nil
-                     {:path path :old-path old-path :before before :after after
-                      :kind kind :similarity similarity}))
+  ([conn context change]
+   (render-file-diff conn context nil change))
   ([conn context normalize
-    {:keys [path old-path before after kind similarity]}]
-   (let [left-entry before
+    {:keys [path old-path before after kind similarity before-db after-db] :as change}]
+   (let [left-conn (entry-conn conn change :before)
+         right-conn (entry-conn conn change :after)
+         left-entry before
          right-entry after
-         nul-binary? (or (entry-has-nul? conn left-entry)
-                         (entry-has-nul? conn right-entry))
+         nul-binary? (or (entry-has-nul? left-conn left-entry)
+                         (entry-has-nul? right-conn right-entry))
          left-bytes (when-not nul-binary?
-                      (or (repo/read-entry conn left-entry) (bytes/empty-bytes)))
+                      (or (repo/read-entry left-conn left-entry) (bytes/empty-bytes)))
          right-bytes (when-not nul-binary?
-                       (or (repo/read-entry conn right-entry) (bytes/empty-bytes)))
+                       (or (repo/read-entry right-conn right-entry) (bytes/empty-bytes)))
          left-text (when left-bytes (decode-text left-bytes))
          right-text (when right-bytes (decode-text right-bytes))
          old-path (or old-path path)
@@ -725,9 +743,9 @@
          b-name (if right-entry (str "b/" path) "/dev/null")
          left-mode (entry-mode left-entry)
          right-mode (entry-mode right-entry)
-         left-full-oid (if left-entry (git-blob-oid conn left-entry)
+         left-full-oid (if left-entry (git-blob-oid left-conn left-entry)
                            (apply str (repeat 40 "0")))
-         right-full-oid (if right-entry (git-blob-oid conn right-entry)
+         right-full-oid (if right-entry (git-blob-oid right-conn right-entry)
                             (apply str (repeat 40 "0")))
          left-oid (subs left-full-oid 0 7)
          right-oid (subs right-full-oid 0 7)
@@ -767,7 +785,7 @@
              patch-body (diff/unified result {:a-name a-name :b-name b-name
                                               :context context})]
          {:path path :old-path old-path :kind kind :similarity similarity
-          :before before :after after
+          :before before :after after :before-db before-db :after-db after-db
           :header header :full-header full-header
           :left-full-oid left-full-oid :right-full-oid right-full-oid
           :patch-body patch-body
@@ -780,7 +798,7 @@
                                     (:edits result)))
           :result result :right-text right-text :binary? false})
        {:path path :old-path old-path :kind kind :similarity similarity
-        :before before :after after
+        :before before :after after :before-db before-db :after-db after-db
         :header header :full-header full-header
         :left-full-oid left-full-oid :right-full-oid right-full-oid
         :patch-body (str "Binary files " a-name " and " b-name " differ\n")
@@ -856,7 +874,7 @@
 (defn- render-patches
   [conn rendered {:keys [binary-patch? full-index? abbrev reverse?]}]
   (apply str
-         (map (fn [{:keys [binary? header full-header patch-body before after]}]
+         (map (fn [{:keys [binary? header full-header patch-body before after] :as change}]
                 (let [header (if (or binary-patch? full-index? (not= abbrev 7))
                                full-header header)
                       header (if (and (not full-index?) (not= abbrev 7))
@@ -883,22 +901,22 @@
                                        (str/replace #" and b/" " and a/"))
                                    patch-body)]
                   (if (and binary-patch? binary?)
-                    (str header (streaming-binary-patch conn before after))
+                    (str header (streaming-binary-patch (entry-conn conn change :before) (entry-conn conn change :after) before after))
                     (str header patch-body))))
               rendered)))
 
 (defn- render-raw [conn rendered worktree-after? abbrev nul-terminated?]
   (apply str
-         (map (fn [{:keys [path old-path kind similarity before after]}]
-                (let [oid #(if % (subs (git-blob-oid conn %) 0 abbrev)
-                               (apply str (repeat abbrev "0")))
+         (map (fn [{:keys [path old-path kind similarity before after] :as change}]
+                (let [oid (fn [side entry] (if entry (subs (git-blob-oid (entry-conn conn change side) entry) 0 abbrev)
+                                               (apply str (repeat abbrev "0"))))
                       separator (if nul-terminated? "\u0000" "\t")
                       terminator (if nul-terminated? "\u0000" "\n")]
                   (str ":" (entry-mode before) " " (entry-mode after) " "
-                       (oid before) " "
+                       (oid :before before) " "
                        (if worktree-after?
                          (apply str (repeat abbrev "0"))
-                         (oid after)) " "
+                         (oid :after after)) " "
                        ({:added "A" :deleted "D" :modified "M"
                          :renamed (format "R%03d" similarity)} kind "M")
                        separator (when (= :renamed kind)
@@ -924,7 +942,8 @@
                             {:path (:path added)
                              :old-path (:path deleted)
                              :kind :renamed :similarity 100
-                             :before (:before deleted) :after (:after added)})))
+                             :before (:before deleted) :after (:after added)
+                             :before-db (:before-db deleted) :after-db (:after-db added)})))
                       (sort-by :path deletions))
         renamed-old (set (map :old-path renames))
         renamed-new (set (map :path renames))]
@@ -945,10 +964,11 @@
     (if (or (zero? pair-count) (> pair-count similarity-max-pairs))
       changes
       (let [payloads (atom {})
-            payload (fn [entry]
-                      (let [id (:content entry)]
+            payload (fn [change side]
+                      (let [entry (get change side)
+                            id (:content entry)]
                         (or (get @payloads id)
-                            (let [value (repo/read-entry conn entry)]
+                            (let [value (repo/read-entry (entry-conn conn change side) entry)]
                               (swap! payloads assoc id value)
                               value))))
             candidates
@@ -957,8 +977,8 @@
                   :when (and (<= (:size (:before deleted)) similarity-max-bytes)
                              (<= (:size (:after added)) similarity-max-bytes))
                   :let [score (similarity/percentage
-                               (payload (:before deleted))
-                               (payload (:after added)) threshold)]
+                               (payload deleted :before)
+                               (payload added :after) threshold)]
                   :when (>= score threshold)]
               {:deleted deleted :added added :score score
                :basename? (= (similarity/basename (:path deleted))
@@ -981,7 +1001,8 @@
                                          :old-path (:path deleted)
                                          :kind :renamed :similarity score
                                          :before (:before deleted)
-                                         :after (:after added)})))
+                                         :after (:after added)
+                                         :before-db (:before-db deleted) :after-db (:after-db added)})))
                          result))
             renamed-old (set (map :old-path selected))
             renamed-new (set (map :path selected))]
@@ -1015,13 +1036,13 @@
                          :eol #(str/replace % #"[ \t]+$" "")
                          nil)
         whitespace-equivalent?
-        (fn [{:keys [before after]}]
-          (let [left (some-> (repo/read-entry conn before) decode-text)
-                right (some-> (repo/read-entry conn after) decode-text)]
+        (fn [{:keys [before after] :as change}]
+          (let [left (some-> (repo/read-entry (entry-conn conn change :before) before) decode-text)
+                right (some-> (repo/read-entry (entry-conn conn change :after) after) decode-text)]
             (and left right
                  (= (mapv normalize-line (str/split-lines left))
                     (mapv normalize-line (str/split-lines right))))))
-        changed (->> (repo/changes conn left right)
+        changed (->> (source-changes conn left right)
                      ;; Git's ordinary diff never reports untracked files.
                      ;; A physical Geschichte projection imports them into its
                      ;; authoritative worktree, so exclude worktree-only rows
@@ -1042,6 +1063,7 @@
         changed (if reverse?
                   (mapv (fn [{:keys [path old-path before after kind] :as change}]
                           (cond-> (assoc change :before after :after before
+                                         :before-db (:after-db change) :after-db (:before-db change)
                                          :kind ({:added :deleted
                                                  :deleted :added}
                                                 kind kind))
@@ -1049,7 +1071,8 @@
                             (assoc :path old-path :old-path path)))
                         changed)
                   changed)
-        rendered (mapv #(render-file-diff conn context normalize-line %) changed)
+        rendered (when-not (or quiet? (and (not check?) (or name-only? name-status?)))
+                   (mapv #(render-file-diff conn context normalize-line %) changed))
         whitespace-errors
         (when check?
           (mapcat (fn [{:keys [path result]}]
@@ -1074,7 +1097,7 @@
           check? (apply str whitespace-errors)
           name-only? (apply str (map #(str (:path %)
                                            (if nul-terminated? "\u0000" "\n"))
-                                     rendered))
+                                     changed))
           name-status? (apply str
                               (map (fn [{:keys [path old-path kind similarity]}]
                                      (let [separator (if nul-terminated? "\u0000" "\t")
@@ -1198,13 +1221,13 @@
           (let [parent-id (get-in commit [:geschichte.commit/parents 0
                                           :geschichte.commit/id])
                 parent (when parent-id (repo/commit-by-id conn parent-id))]
-            (->> (repo/changes conn (or parent :empty) commit)
+            (->> (source-changes conn (or parent :empty) commit)
                  (filterv #(or (nil? allowed-kinds)
                                (contains? allowed-kinds (:kind %)))))))
         pickaxe-match?
         (fn [change]
-          (let [before (some-> (repo/read-entry conn (:before change)) decode-text)
-                after (some-> (repo/read-entry conn (:after change)) decode-text)
+          (let [before (some-> (repo/read-entry (entry-conn conn change :before) (:before change)) decode-text)
+                after (some-> (repo/read-entry (entry-conn conn change :after) (:after change)) decode-text)
                 count-matches (fn [text]
                                 (if text
                                   (count (re-seq (re-pattern
@@ -1922,8 +1945,8 @@
             parent (when parent-id (repo/commit-by-id conn parent-id))
             changes (filterv #(or (nil? allowed-kinds)
                                   (contains? allowed-kinds (:kind %)))
-                             (repo/changes conn (or parent :empty) commit))
-            rendered (when (or stat? name-only? (not no-patch?))
+                             (source-changes conn (or parent :empty) commit))
+            rendered (when (or stat? (and (not name-only?) (not no-patch?)))
                        (mapv #(render-file-diff conn %) changes))
             body (cond
                    stat? (render-stat rendered)
@@ -2350,7 +2373,7 @@
                                   :geschichte.commit/id])
         parent (when parent-id (repo/commit-by-id conn parent-id))]
     {:parent parent
-     :changes (repo/changes conn (or parent :empty) commit)}))
+     :changes (source-changes conn (or parent :empty) commit)}))
 
 (defn- apply-tree-changes [tree changes]
   (reduce (fn [tree {:keys [path after]}]

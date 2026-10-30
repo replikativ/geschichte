@@ -3,9 +3,13 @@
 
   Geschichte uses UUID commit identities and Datahike storage, so differential
   tests compare stable user-visible semantics rather than serialized objects."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [datahike.api :as d]
             [geschichte.cli :as cli]
+            [geschichte.bytes :as bytes]
+            [geschichte.content :as content]
+            [geschichte.historical-source-fixture :as fixture]
             [geschichte.git.command :as command]
             [geschichte.repo :as repo])
   (:import [java.nio.file Files Path]
@@ -60,7 +64,7 @@
 
 (deftest native-git-revision-range-oracle
   (if-not (git-available?)
-    (is true "native Git is unavailable; differential oracle skipped")
+    (is false "Native Git is required for differential oracle tests")
     (let [root (Files/createTempDirectory
                 "geschichte-git-oracle-" (make-array FileAttribute 0))
           cfg {:store {:backend :memory :id (random-uuid)}
@@ -129,7 +133,7 @@
 
 (deftest native-git-diff-format-oracle
   (if-not (git-available?)
-    (is true "native Git is unavailable; differential oracle skipped")
+    (is false "Native Git is required for differential oracle tests")
     (let [root (Files/createTempDirectory
                 "geschichte-git-diff-oracle-" (make-array FileAttribute 0))
           cfg {:store {:backend :memory :id (random-uuid)}
@@ -290,7 +294,7 @@
 
 (deftest physical-projection-status-oracle
   (if-not (git-available?)
-    (is true "native Git is unavailable; differential oracle skipped")
+    (is false "Native Git is required for differential oracle tests")
     (let [git-root (Files/createTempDirectory
                     "geschichte-native-worktree-" (make-array FileAttribute 0))
           ges-root (Files/createTempDirectory
@@ -341,3 +345,57 @@
         (finally
           (delete-tree! git-root)
           (delete-tree! ges-root))))))
+
+(deftest historical-snapshot-diff-and-presentation-oracle
+  (is (git-available?) "Native Git is required for differential oracle tests")
+  (when (git-available?)
+    (doseq [[kind options] [[:line-delta {}]
+                            [:full {:original "before\u0000" :text "binary\u0000historical" :tip-text "binary\u0000tip"}]
+                            [:line-delta {:tip-text (.replace (apply str (map #(str "unchanged line " % " padding\n") (range 300))) "line 200" "changed line 200")}]
+                            [:full {:original "base" :text "text with spaces\n" :tip-path "old.txt" :tip-text "text  with  spaces\n"}]]]
+      (fixture/with-archive
+        kind options
+        (fn [{:keys [conn c1 text tip-path tip-text]}]
+          (let [root (Files/createTempDirectory "geschichte-historical-oracle-" (make-array FileAttribute 0))
+                run #(command/execute {:conn conn :root "/project" :config (atom {}) :repo-relative identity} %)]
+            (try
+              (is (= text (bytes/decode-utf8-strict (repo/read-entry conn (get (repo/tree-at conn c1) "old.txt") c1))))
+              (process root "init" "-q" "-b" "main")
+              (process root "config" "user.name" "Fixture")
+              (process root "config" "user.email" "fixture@example.test")
+              (spit (.toFile (.resolve root "base.txt")) "base\n")
+              (spit (.toFile (.resolve root "old.txt")) text)
+              (process root "add" ".")
+              (process root "commit" "-qm" "archive")
+              (process root "branch" "archive")
+              (Files/delete (.resolve root "old.txt"))
+              (spit (.toFile (.resolve root tip-path)) tip-text)
+              (process root "add" "-A")
+              (process root "commit" "-qm" "tip")
+              (doseq [options [["--no-renames"] ["--no-renames" "-R"] ["--no-renames" "--raw"]
+                               ["--name-only"] ["--name-status"] ["--numstat"]
+                               ["--quiet"] ["--no-renames" "--binary" "--full-index"] ["--name-only" "-w"] ["-M"]]]
+                (let [argv (into ["diff"] (concat options ["archive" "main"]))
+                      expected (apply process root argv)
+                      actual (run argv)]
+                  (is (= (:exit expected) (:exit actual)) (pr-str argv))
+                  (if (and (some #{"--binary"} options) (str/includes? text "\u0000"))
+                    ;; zlib streams differ across native Git/JDK versions. Prove
+                    ;; the binary patch reconstructs the historical bytes.
+                    (do
+                      (is (zero? (:exit (process-input root (:stdout actual) "apply" "--reverse"))))
+                      (is (= text (slurp (.toFile (.resolve root "old.txt")))))
+                      (process root "reset" "--hard" "main"))
+                    ;; Native Git appends heuristic function context to hunk
+                    ;; headers; this command subset does not implement it.
+                    (let [normalize #(str/replace % #"(?m)^(@@.*?@@)[^\n]*" "$1")]
+                      (is (= (normalize (:output expected)) (normalize (:stdout actual))) (pr-str argv))))))
+              (is (zero? (:exit (run ["show" "archive"]))))
+              (is (zero? (:exit (run ["log" "-p" "archive"]))))
+              (is (zero? (:exit (run ["log" "-S" "changed line 150" "archive"]))))
+              (with-redefs [repo/read-entry (fn [& _] (throw (ex-info "unexpected payload read" {})))
+                            content/consume-by-id! (fn [& _] (throw (ex-info "unexpected streaming read" {})))]
+                (doseq [options [["--no-renames" "--quiet"] ["--no-renames" "--name-only"]
+                                 ["--no-renames" "--name-status"]]]
+                  (is (#{0 1} (:exit (run (into ["diff"] (concat options ["archive" "main"]))))))))
+              (finally (delete-tree! root)))))))))

@@ -3,6 +3,7 @@
             [cljs.test :refer-macros [async deftest is]]
             [datahike.api :as d]
             [geschichte.bytes :as bytes]
+            [geschichte.content :as content]
             [geschichte.repo :as repo]
             [geschichte.workspace :as workspace]
             [is.simm.partial-cps.core-async :as bridge]))
@@ -227,4 +228,54 @@
                                 (<! (take-cps (workspace/publish! nil nil {:expected-checkpoint value}))))
                                nil (catch :default error error))]
                  (is (= ::workspace/invalid-publication-options (:type (ex-data failure))))))
+             (finally (done))))))
+
+(deftest node-historical-source-restores-selected-bytes
+  (async done
+         (go
+           (try
+             (doseq [kind [:full :line-delta :chunks]]
+               (let [cfg {:store {:backend :memory :id (random-uuid)} :schema-flexibility :write
+                          :keep-history? true :commit-graph? true}
+                     original (apply str (map #(str "unchanged line " % " padding\n") (range 300)))
+                     text (.replace original "line 150" "changed line 150")]
+                 (try
+                   (<! (d/create-database cfg))
+                   (let [canonical (<! (d/connect cfg {:sync? false}))]
+                     (try
+                       (bridge/unwrap-result (<! (take-cps (repo/init! canonical))))
+                       (bridge/unwrap-result (<! (take-cps (repo/write! canonical "base" (bytes/utf8 "base")))))
+                       (bridge/unwrap-result (<! (take-cps (repo/stage-all! canonical))))
+                       (bridge/unwrap-result (<! (take-cps (repo/commit! canonical {:message "base"}))))
+                       (bridge/unwrap-result (<! (take-cps (workspace/fork! canonical "historical"))))
+                       (let [worker (<! (d/connect (assoc cfg :branch :geschichte.workspace/historical) {:sync? false}))]
+                         (try
+                           (bridge/unwrap-result (<! (take-cps (repo/write! worker "old" (bytes/utf8 original)))))
+                           (let [selected (bridge/unwrap-result (<! (take-cps
+                                                                     (repo/write! worker "old" (bytes/utf8 text)
+                                                                                  (case kind
+                                                                                    :full {:delta-ratio 0}
+                                                                                    :chunks {:chunk-threshold 1 :chunk-min-size 64 :chunk-size 128 :chunk-max-size 256}
+                                                                                    nil)))))]
+                             (is (= kind (:geschichte.content/kind (content/info worker (:content selected))))))
+                           (bridge/unwrap-result (<! (take-cps (repo/stage-all! worker))))
+                           (let [commit (bridge/unwrap-result (<! (take-cps (repo/commit! worker {:message "old"}))))]
+                             (bridge/unwrap-result (<! (take-cps (repo/remove! worker "old"))))
+                             (bridge/unwrap-result (<! (take-cps (repo/write! worker "tip" (bytes/utf8 "tip")))))
+                             (bridge/unwrap-result (<! (take-cps (repo/stage-all! worker))))
+                             (bridge/unwrap-result (<! (take-cps (repo/commit! worker {:message "tip"}))))
+                             (bridge/unwrap-result (<! (take-cps (workspace/publish! canonical worker))))
+                             (let [entry (get (bridge/unwrap-result (<! (take-cps (repo/tree-at canonical commit)))) "old")]
+                               (is (nil? (d/q '[:find ?e . :in $ ?id :where [?e :geschichte.content/id ?id]] @canonical (:content entry))))
+                               (let [historical (bridge/unwrap-result (<! (take-cps (repo/read-entry canonical entry commit))))]
+                                 (is (= text (bytes/decode-utf8 historical))))
+                               (bridge/unwrap-result (<! (take-cps (repo/restore-paths! canonical ["old"] {:source commit :staged? true}))))
+                               (is (= text (bytes/decode-utf8
+                                            (bridge/unwrap-result (<! (take-cps (repo/read canonical "old")))))))))
+                           (finally (d/release worker))))
+                       (finally (d/release canonical))))
+                   (finally (<! (d/delete-database cfg))))))
+             (catch :default error
+               (js/console.error (.-stack (or (ex-cause error) error)))
+               (is false (str error)))
              (finally (done))))))

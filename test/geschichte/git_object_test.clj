@@ -55,3 +55,14 @@
             :type :commit :tag "v1" :message "release\n"}
            (select-keys (object/parse-tag tag-bytes)
                         [:object :type :tag :message])))))
+
+(deftest exact-parent-order-is-part-of-git-object-identity
+  (let [a (apply str (repeat 40 "a")) b (apply str (repeat 40 "b"))
+        base {:tree (apply str (repeat 40 "c"))
+              :author "Fixture <fixture@example.test> 0 +0000"
+              :committer "Fixture <fixture@example.test> 0 +0000" :message "merge"}
+        left (object/commit-payload (assoc base :parents [b a]))
+        right (object/commit-payload (assoc base :parents [a b]))]
+    (is (= [b a] (:parents (object/parse-commit left))))
+    (is (= [a b] (:parents (object/parse-commit right))))
+    (is (not= (object/object-id :commit left) (object/object-id :commit right)))))
