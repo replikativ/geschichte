@@ -51,6 +51,9 @@ compression chunks. All work shares one operation and deadline. Choose smaller
 host limits when appropriate; finite defaults are not a service quota.
 
 Remote publication currently requires SHA-1 and `report-status`, updates exactly
-one branch, and accepts only an unambiguous status for that branch. Branch
-deletion, force push, automatic retries and credential storage are outside this
+one branch, and accepts only an unambiguous status for that branch. Status
+pkt-lines accept an optional final LF as required by
+[Git's pkt-line specification](https://git-scm.com/docs/gitprotocol-common).
+This does not permit extra status lines, extra flush packets or another ref.
+Branch deletion, force push, automatic retries and credential storage are outside this
 API.

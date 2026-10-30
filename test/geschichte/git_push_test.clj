@@ -174,6 +174,30 @@
                                       "https://example.test/repo.git" prepared (op))
                      nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))))
 
+(deftest report-status-accepts-optional-line-feeds-without-relaxing-the-report-shape
+  ;; gitprotocol-common requires receivers to accept non-binary pkt-lines
+  ;; with or without their final LF. Keep exact single-ref acknowledgment.
+  (let [prepared {:version 1 :projection push/projection :ref "refs/heads/main"
+                  :old (apply str (repeat 40 "a")) :new (apply str (repeat 40 "b"))
+                  :pack (byte-array 0) :capabilities ["report-status"]}]
+    (doseq [unpack-lf ["" "\n"] status-lf ["" "\n"] status [:pushed :rejected]]
+      (let [line (if (= :pushed status) "ok refs/heads/main" "ng refs/heads/main rejected")
+            sender (constantly {:status 200 :body (pkt/encode [(str "unpack ok" unpack-lf)
+                                                               (str line status-lf) :flush])})]
+        (is (= status (:status (push/send-http! sender "https://example.test/repo.git" prepared (op)))))))
+    (doseq [report [["unpack ok" "ok refs/heads/main" "ok refs/heads/main" :flush]
+                    ["unpack ok" "ok refs/heads/other" :flush]
+                    ["unpack ok" "ok refs/heads/main"]
+                    ["unpack ok" "ok refs/heads/main" :flush :flush]
+                    ["unpack ok\n\n" "ok refs/heads/main" :flush]
+                    ["unpack ok" "ok refs/heads/main\n\n" :flush]
+                    ["unpack ok" "ok refs/heads/main " :flush]
+                    ["unpack error" "ok refs/heads/main" :flush]]]
+      (is (= :outcome-unconfirmed
+             (try (push/send-http! (constantly {:status 200 :body (pkt/encode report)})
+                                   "https://example.test/repo.git" prepared (op))
+                  nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
+
 (deftest bounded-pack-keeps-the-existing-wire-format
   (let [payload (object/utf8 "Example\n") objects {(object/object-id :blob payload) {:type :blob :payload payload}}]
     (is (= (seq (pack/encode objects)) (seq (pack/encode-bounded objects (op)))))))

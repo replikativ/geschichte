@@ -220,6 +220,10 @@
   (let [remote (inspect-remote! send-fn url (:ref opts) (:expected-remote-oid opts) (:operation opts))]
     (assoc (prepare conn head opts) :capabilities (:capabilities remote))))
 
+(defn- status-line [frame]
+  (let [line (pkt/text frame)]
+    (if (str/ends-with? line "\n") (subs line 0 (dec (count line))) line)))
+
 (defn send-http!
   "Dispatch ONE caller-admitted update with the SAME expected OID in wire CAS.
    A thrown/malformed/missing result is unknown; this API never retries."
@@ -241,9 +245,12 @@
         report (receive/parse-report response)]
     (when-not (and (= 3 (count frames)) (= :flush (last frames))
                    (every? bytes? (take 2 frames))
-                   (= "unpack ok\n" (pkt/text (first frames)))
-                   (let [line (pkt/text (second frames))]
-                     (or (= (str "ok " (:ref prepared) "\n") line)
+                   ;; Non-binary pkt-lines permit an optional final LF. Strip
+                   ;; that single byte only; whitespace and report shape remain
+                   ;; exact (gitprotocol-common, pkt-line format).
+                   (= "unpack ok" (status-line (first frames)))
+                   (let [line (status-line (second frames))]
+                     (or (= (str "ok " (:ref prepared)) line)
                          (str/starts-with? line (str "ng " (:ref prepared) " ")))))
       (refuse! :outcome-unconfirmed))
     (when-not (and (= "ok" (:unpack report)) (= #{(:ref prepared)} (set (keys (:refs report))))
