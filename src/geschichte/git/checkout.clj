@@ -54,18 +54,16 @@
                        (stored-object object-store tree-oid :tree opts)))))
 
 (defn- logical-ids [conn oids]
-  (let [existing
-        (into {}
-              (d/q '[:find ?oid ?id
-                     :where
-                     [?e :geschichte.commit/git-oid ?oid]
-                     [?e :geschichte.commit/id ?id]] @conn))]
+  ;; Resolve only the admitted graph against one captured catalog. Authored
+  ;; UUIDs take precedence over deterministic import identities.
+  (let [db @conn]
     (into {}
           (map (fn [oid]
-                 [oid (or (get existing oid)
+                 [oid (or (d/q '[:find ?id . :in $ ?oid
+                                 :where [?e :geschichte.commit/git-oid ?oid]
+                                 [?e :geschichte.commit/id ?id]] db oid)
                           (UUID/nameUUIDFromBytes
-                           (.getBytes (str "geschichte:git:sha1:" oid)
-                                      "UTF-8")))]))
+                           (.getBytes (str "geschichte:git:sha1:" oid) "UTF-8")))]))
           oids)))
 
 (defn- identity-and-time [person]

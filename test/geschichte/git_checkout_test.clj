@@ -161,3 +161,28 @@
           (d/release target)
           (d/delete-database source-cfg)
           (d/delete-database target-cfg))))))
+
+(deftest requested-logical-ids-ignore-unrelated-oid-mappings
+  (let [cfg (config)]
+    (d/create-database cfg)
+    (let [conn (d/connect cfg)]
+      (try
+        (repo/init! conn)
+        (let [rows (mapv (fn [n] {:geschichte.commit/id (random-uuid)
+                                  :geschichte.commit/git-oid (format "%040x" n)}) (range 120))
+              _ (d/transact conn rows)
+              requested [(:geschichte.commit/git-oid (first rows)) (format "%040x" 999)]
+              db @conn reads (atom 0) calls (atom []) query d/q
+              source (reify clojure.lang.IDeref (deref [_] (swap! reads inc) db))
+              result (with-redefs [d/q (fn [form snapshot oid]
+                                         (swap! calls conj oid)
+                                         (query form snapshot oid))]
+                       (#'checkout/logical-ids source requested))]
+          (is (= (:geschichte.commit/id (first rows)) (get result (first requested))))
+          (is (= (java.util.UUID/nameUUIDFromBytes
+                  (.getBytes (str "geschichte:git:sha1:" (second requested)) "UTF-8"))
+                 (get result (second requested))))
+          (is (= 1 @reads))
+          (is (= requested @calls))
+          (is (= (set requested) (set (keys result)))))
+        (finally (d/release conn) (d/delete-database cfg))))))
