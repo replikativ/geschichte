@@ -11,6 +11,7 @@
             [datahike.experimental.graph-spec :as graph-spec]
             [geschichte.merge.core :as core]
             [geschichte.budget :as budget]
+            [geschichte.content :as content]
             [geschichte.merge.policy :as policy]
             [geschichte.text-budget :as text-budget]
             [geschichte.repo :as repo]))
@@ -51,35 +52,61 @@
                         (budget/check! operation)
                         [(:geschichte.commit/id (d/pull db [:geschichte.commit/id] eid)) distance])) by-eid)))))
 
-(defn- tree-at-bounded [db commit operation]
+(defn- tree-at-bounded [snapshot operation]
   (budget/check! operation)
-  (let [commit (d/pull db [:geschichte.commit/snapshot] [:geschichte.commit/id commit])
-        snapshot (when-let [id (:geschichte.commit/snapshot commit)] (d/commit-as-db db id))]
-    (when-not snapshot (throw (ex-info "Missing commit snapshot" {:commit commit})))
-    (reduce (fn [out datom]
-              (budget/charge! operation :tree-entries 1)
-              (let [path (:v datom)
-                    size (text-budget/utf8-size operation path)]
-                (budget/bound! operation :path-bytes size)
-                (budget/charge! operation :tree-path-bytes size)
-                (let [entry (d/pull snapshot [:geschichte.stage/state :geschichte.stage/size
-                                              :geschichte.stage/mode
-                                              {:geschichte.stage/content [:geschichte.content/id]}] (:e datom))]
-                  (if (= :present (:geschichte.stage/state entry))
-                    (do (let [id (get-in entry [:geschichte.stage/content :geschichte.content/id])
-                              size (:geschichte.stage/size entry)
-                              mode (:geschichte.stage/mode entry)
-                              content (when (uuid? id) (d/pull db [:geschichte.content/size] [:geschichte.content/id id]))]
-                          (when-not (and (integer? size) (<= 0 size Long/MAX_VALUE)
-                                         (integer? mode) (<= 0 mode Long/MAX_VALUE)
-                                         (uuid? id) (= size (:geschichte.content/size content)))
-                            (throw (ex-info "Invalid logical tree entry metadata" {:type ::invalid-tree-entry :path path}))))
-                        (budget/bound! operation :object-bytes (:geschichte.stage/size entry))
-                        (budget/charge! operation :tree-bytes (:geschichte.stage/size entry))
-                        (assoc out path {:content (get-in entry [:geschichte.stage/content :geschichte.content/id])
-                                         :size (:geschichte.stage/size entry) :mode (:geschichte.stage/mode entry)}))
-                    out))))
-            (sorted-map) (d/datoms snapshot :avet :geschichte.stage/path))))
+  (reduce (fn [out datom]
+            (budget/charge! operation :tree-entries 1)
+            (let [path (:v datom)
+                  size (text-budget/utf8-size operation path)]
+              (budget/bound! operation :path-bytes size)
+              (budget/charge! operation :tree-path-bytes size)
+              (let [entry (d/pull snapshot [:geschichte.stage/state :geschichte.stage/size
+                                            :geschichte.stage/mode
+                                            {:geschichte.stage/content [:geschichte.content/id]}] (:e datom))]
+                (if (= :present (:geschichte.stage/state entry))
+                  (do (let [id (get-in entry [:geschichte.stage/content :geschichte.content/id])
+                            size (:geschichte.stage/size entry)
+                            mode (:geschichte.stage/mode entry)
+                            content (when (uuid? id) (d/pull snapshot [:geschichte.content/size] [:geschichte.content/id id]))]
+                        (when-not (and (integer? size) (<= 0 size Long/MAX_VALUE)
+                                       (integer? mode) (<= 0 mode Long/MAX_VALUE)
+                                       (uuid? id) (= size (:geschichte.content/size content)))
+                          (throw (ex-info "Invalid logical tree entry metadata" {:type ::invalid-tree-entry :path path}))))
+                      (budget/bound! operation :object-bytes (:geschichte.stage/size entry))
+                      (budget/charge! operation :tree-bytes (:geschichte.stage/size entry))
+                      (assoc out path {:content (get-in entry [:geschichte.stage/content :geschichte.content/id])
+                                       :size (:geschichte.stage/size entry) :mode (:geschichte.stage/mode entry)}))
+                  out))))
+          (sorted-map) (d/datoms snapshot :avet :geschichte.stage/path)))
+
+(defn- commit-view [db id]
+  (let [commit (d/pull db [:geschichte.commit/snapshot] [:geschichte.commit/id id])
+        snapshot (when-let [checkpoint (:geschichte.commit/snapshot commit)] (d/commit-as-db db checkpoint))]
+    (when-not snapshot (throw (ex-info "Missing commit snapshot" {:commit id})))
+    snapshot))
+
+(defn- restore-result-content!
+  "A clean plan must be materializable. Historical representations need not be
+   in today's catalog: reconstruct missing selected bytes from their exact
+   commit view, using the existing guarded content writer. Only immutable
+   content is added; no HEAD, worktree or index changes during planning."
+  [conn result views trees operation]
+  (when (:clean? result)
+    (doseq [[path {:keys [content size] :as entry}] (:tree result)]
+      (budget/check! operation)
+      (when-not (d/q '[:find ?e . :in $ ?id :where [?e :geschichte.content/id ?id]] @conn content)
+        (let [source (some (fn [[view tree]] (when (= entry (get tree path)) view)) (map vector views trees))]
+          (when-not source (throw (ex-info "Merge result has no content source" {:path path :content content})))
+          (let [value (content/read-by-id (reify clojure.lang.IDeref (deref [_] source)) content
+                                          {:sync? true :merge-budget operation :read-db source})]
+            (when-not (= size (alength ^bytes value))
+              (throw (ex-info "Historical merge content size mismatch" {:path path})))
+            (budget/charge! operation :merge-output-bytes size)
+            (budget/check! operation)
+            (when-not (= content (content/transact-content! conn value nil (constantly []) {:sync? true}))
+              (throw (ex-info "Historical merge content identity mismatch" {:path path})))
+            (budget/check! operation))))))
+  result)
 
 (defn ancestor-distances
   "Return {commit-id shortest-parent-distance}, including the root at distance 0.
@@ -108,14 +135,16 @@
 
 (defn plan
   "Plan a three-tree merge without staging or advancing repository refs.
-  Default content resolution may store merged immutable content in this
-  caller-owned private connection, even if a later path conflicts/refuses.
+  Default content resolution may store merged or restored immutable content in
+  this caller-owned private connection, even if a later path conflicts/refuses.
   :merge-budget opts into the complete finite profile and one captured source
   snapshot; typed resource refusals are errors, never ordinary conflicts.
 
   Tree values are stable logical content/mode metadata, so physical full-vs-delta
-  choices cannot create conflicts. Returns a resolved `:tree` plus structural
-  conflicts containing base/ours/theirs values (or `::absent` for deletion)."
+  choices cannot create conflicts. Clean results restore any selected historical
+  content missing from the current private catalog before returning. Returns a
+  resolved `:tree` plus structural conflicts containing base/ours/theirs values
+  (or `::absent` for deletion)."
   ([conn ours theirs] (plan conn ours theirs nil))
   ([conn ours theirs {:keys [merge-content? merge-budget] :or {merge-content? true}}]
    (when (some? merge-budget) (policy/require! merge-budget))
@@ -133,13 +162,16 @@
      ;; default would mean every existing caller keeps arbitrating merges that
      ;; resolve themselves. `:merge-content? false` restores the structural-only
      ;; plan for callers that want to see raw tree divergence.
-     (core/plan-trees base ours theirs
-                      (if merge-budget (tree-at-bounded db base merge-budget) (repo/tree-at conn base))
-                      (if merge-budget (tree-at-bounded db ours merge-budget) (repo/tree-at conn ours))
-                      (if merge-budget (tree-at-bounded db theirs merge-budget) (repo/tree-at conn theirs))
-                      {:merge-budget merge-budget
-                       :resolve-content (when merge-content?
-                                          (repo/content-merger conn {:merge-budget merge-budget :read-db db}))}))))
+     (let [views (mapv #(commit-view db %) [base ours theirs])
+           trees (mapv (fn [view commit]
+                         (if merge-budget (tree-at-bounded view merge-budget)
+                             (repo/tree-at (reify clojure.lang.IDeref (deref [_] db)) commit))) views [base ours theirs])
+           result (apply core/plan-trees
+                         (concat [base ours theirs] trees
+                                 [{:merge-budget merge-budget
+                                   :resolve-content (when merge-content?
+                                                      (repo/content-merger conn {:merge-budget merge-budget :read-dbs views}))}]))]
+       (restore-result-content! conn result views trees merge-budget)))))
 
 (defn prepare!
   "Plan and stage a clean merge. Conflicting plans are returned unchanged and do

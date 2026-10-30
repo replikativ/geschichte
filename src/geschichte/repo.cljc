@@ -984,23 +984,29 @@
   any entry whose `:mode` differs across the sides (a file that became a symlink
   is not a text change).
 
+  Optional :read-dbs supplies [base ours theirs] immutable content views; :read-db
+  supplies one shared view. Readers use these views even without a budget.
+
   JVM-shaped: it reads and writes synchronously, which is why it lives here
   rather than in the portable planner."
   ([conn] (content-merger conn nil))
-  ([conn {:keys [max-bytes merge-budget read-db] :or {max-bytes (* 1 1024 1024)}}]
+  ([conn {:keys [max-bytes merge-budget read-db read-dbs] :or {max-bytes (* 1 1024 1024)}}]
+   (when (and (some? read-dbs) (not (and (vector? read-dbs) (= 3 (count read-dbs)) (every? some? read-dbs))))
+     (throw (ex-info "Content merge requires three immutable source views" {})))
    (fn [_path base ours theirs]
      (let [entries [base ours theirs]]
        (when (and (apply = (map :mode entries))
                   (every? #(<= (or (:size %) 0) max-bytes) entries))
-         (let [texts (mapv (fn [{:keys [content]}]
+         (let [texts (mapv (fn [{:keys [content]} source]
                              (try
-                               (let [bs (content/read-by-id conn content (when merge-budget {:merge-budget merge-budget :read-db read-db}))
+                               (let [reader (if source (atom source) conn)
+                                     bs (content/read-by-id reader content (when merge-budget {:merge-budget merge-budget :read-db source}))
                                      s (when bs (bytes/decode-utf8-strict bs))]
                                  (when (and s (not (str/includes? s "\u0000")))
                                    s))
                                (catch #?(:clj Exception :cljs :default) error
                                  (if (budget/failure? error) (throw error) nil))))
-                           entries)]
+                           entries (or read-dbs (repeat read-db)))]
            (when (every? some? texts)
              (let [[b o t] texts
                    {:keys [clean? text]} (text/merge-text b o t {:merge-budget merge-budget})]

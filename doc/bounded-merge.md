@@ -30,9 +30,10 @@ a simulated world. `budget/snapshot` returns ordinary policy/counter data.
 ## Snapshot and publication contract
 
 A bounded plan captures one immutable catalog database. Both native ancestry
-walks, commit checkpoint selection, all three tree projections and existing
-content metadata use that snapshot. Historical stage sizes must agree with that
-snapshot's content metadata. Payloads remain content addressed and are hash
+walks and commit checkpoint selection use that catalog snapshot. Each tree and
+its content metadata use the selected commit's own immutable snapshot.
+Historical stage sizes must agree with that commit snapshot's content metadata.
+Payloads remain content addressed and are hash
 checked when read. The planner does not eagerly read unchanged structural blobs;
 logical tree-byte accounting is distinct from physical payload accounting.
 
@@ -71,12 +72,13 @@ entries, output vectors, reconstructed buffers or trace copies.
 | `:text-work` | Checked character/line/algorithm work, including conservative map-copy comparison reservations |
 | `:text-trace-cells` | Cells retained in Myers frontier copies |
 | `:delta-forms` | Generated-delta structural forms and atomic/string tokens |
-| `:merge-output-bytes` | UTF-8 bytes of newly assembled merge text, including conflict display text |
+| `:merge-output-bytes` | Newly assembled text bytes (including conflict display) and restored selected content bytes |
 
 Per-value bounds are `:object-bytes`, `:path-bytes`, `:content-depth`,
 `:delta-edn-depth`, `:delta-token-chars` and `:text-frontier-cells`. Input and
 candidate tree byte budgets include unchanged files and structural-only plans;
-`:merge-output-bytes` specifically measures assembled text, not the whole tree.
+`:merge-output-bytes` counts assembled text and restored selected content. It
+does not charge unchanged content that is already present in the current catalog.
 
 Generated line deltas receive a lexical preflight over every character before
 EDN parsing, followed by strict generated-schema/range checks. Dispatch, tagged,
@@ -107,6 +109,18 @@ interrupt arbitrary blocked storage implementations or custom streams. The host
 must retain operation ownership and admission slots until physical exit. Native
 HTTP fetch has its separately documented owned-body watchdog; it does not make
 an arbitrary storage read preemptible.
+
+Historical trees and their content representations are read from their own
+immutable commit snapshots, rather than the current mutable content catalog.
+After workspace publication, that catalog can legitimately omit older
+representations. A clean plan reconstructs missing selected result content in
+the caller-owned private connection using the existing guarded content writer;
+logical IDs stay unchanged, while physical representations may differ. These
+reads and output bytes share the planning budget. Planning may therefore add
+immutable content, including before a later refusal, but never changes HEAD,
+the worktree or the index. Callers must keep planning isolated and own cleanup.
+This is a guarantee of clean results produced by `merge/plan`, not validation
+of arbitrary externally constructed maps passed to `repo/prepare-merge!`.
 
 Typed errors use `geschichte.budget` (or the existing Git error namespace when
 using a Git-created operation): `invalid-policy`, `exceeded`,
