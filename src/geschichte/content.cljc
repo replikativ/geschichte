@@ -131,9 +131,8 @@
   (async+sync (:sync? opts)
               (async
                (let [stored
-                     (await
-                      (payload/get-bytes
-                       conn (:geschichte.content/payload entity) opts))]
+                     (when-let [payload-id (:geschichte.content/payload entity)]
+                       (await (payload/get-bytes conn payload-id opts)))]
                  (case (:geschichte.content/kind entity)
                    :full (do (budget/charge! (:merge-budget opts) :content-decoded-bytes (bytes/length stored)) stored)
                    :chunks

@@ -187,7 +187,34 @@
      (stage-map (await (snapshot-db conn commit)))
      {})))
 
-(declare tree-at)
+(defn- resolve-source [conn source]
+  (platform-async
+   (let [db @conn
+         commit (cond
+                  (or (nil? source) (= source :head)) (head-commit (atom db))
+                  (map? source) source
+                  (uuid? source) (query/commit db source))
+         snapshot (when commit (await (snapshot-db (atom db) commit)))]
+     (cond
+       (#{:empty :index :worktree} source) {:db db}
+       snapshot {:db snapshot :commit commit}
+       (and (nil? commit) (or (nil? source) (= source :head))) {:db db}
+       :else (throw (ex-info "Unknown Geschichte commit" {:commit source}))))))
+
+(defn source-view
+  "Resolve a tree and its authoritative immutable content DB once.
+
+   Views are short-lived readers, not retention roots. Keep the source store
+   alive for their lifetime. Tree entries remain pure logical metadata."
+  [conn source]
+  (platform-async
+   (let [{:keys [db commit] :as view} (await (resolve-source conn source))]
+     (assoc view :tree (cond
+                         (= source :empty) {}
+                         (= source :index) (stage-map db)
+                         (= source :worktree) (query/worktree db)
+                         commit (stage-map db)
+                         :else {})))))
 
 (defn index-tree
   "Return the current staging index as a sorted path-to-entry map. Explicit
@@ -196,26 +223,49 @@
   (stage-map @conn))
 
 (defn tree
-  "Return a repository tree selected by `source`.
-
-   Portable source names are `:head`, `:index`, `:worktree`, and `:empty`.
-   A logical commit map or UUID selects that historical committed tree."
+  "Return a pure tree selected by :head, :index, :worktree, :empty, or commit."
   ([conn] (tree conn :head))
   ([conn source]
-   (platform-async
-    (cond
-      (= source :empty) {}
-      (= source :index) (index-tree conn)
-      (= source :worktree) (query/worktree @conn)
-      (or (nil? source) (= source :head)) (await (head-map conn))
-      :else (await (tree-at conn source))))))
+   (platform-async (:tree (await (source-view conn source))))))
 
 (defn read-entry
-  "Load the bytes named by a tree entry returned by `tree` or `changes`."
-  [conn entry]
-  (platform-async
-   (when-let [id (:content entry)]
-     (await (content/read-by-id conn id)))))
+  "Read a current entry, or supply its explicit source for historical entries.
+   The source uses the same vocabulary as `tree`; no provenance is persisted."
+  ([conn entry]
+   (platform-async
+    (when-let [id (:content entry)]
+      (await (content/read-by-id (atom @conn) id)))))
+  ([conn entry source]
+   (platform-async
+    (when-let [id (:content entry)]
+      (let [view (await (resolve-source conn source))]
+        (await (content/read-by-id (atom (:db view)) id)))))))
+
+(defn ensure-tree-content!
+  "Prepare missing selected content through the guarded content writer.
+
+   `source-db` returns the immutable DB for a path/entry. Only immutable content
+   is added; later refusal may retain preparation but never installs public
+   HEAD/work/index state. Caller owns and serializes destination mutations."
+  ([conn tree source-db] (ensure-tree-content! conn tree source-db nil))
+  ([conn tree source-db {:keys [merge-budget]}]
+   (platform-async
+    (doseq [[path {:keys [content size] :as entry}] tree]
+      (budget/check! merge-budget)
+      (when-not (d/q '[:find ?e . :in $ ?id :where [?e :geschichte.content/id ?id]] @conn content)
+        (let [source (or (source-db path entry)
+                         (throw (ex-info "Selected entry has no content source" {:path path :content content})))
+              value (await (content/read-by-id (atom source) content
+                                               {:sync? (:sync? execution/default-opts)
+                                                :merge-budget merge-budget :read-db source}))]
+          (when-not (= size (bytes/length value))
+            (throw (ex-info "Historical content size mismatch" {:path path})))
+          (budget/charge! merge-budget :merge-output-bytes size)
+          (budget/check! merge-budget)
+          (when-not (= content (await (content/transact-content! conn value nil (constantly []))))
+            (throw (ex-info "Historical content identity mismatch" {:path path})))
+          (budget/check! merge-budget))))
+    tree)))
 
 (defn- change-kind [before after]
   (cond
@@ -275,42 +325,14 @@
 
 (defn tree-at
   "Return path metadata for a logical commit, or current HEAD when omitted."
-  ([conn]
-   (head-map conn))
-  ([conn commit]
-   (platform-async
-    (let [commit (cond
-                   (map? commit) commit
-                   (uuid? commit)
-                   (d/pull @conn [:geschichte.commit/id
-                                  :geschichte.commit/snapshot]
-                           [:geschichte.commit/id commit])
-                   :else nil)]
-      (when-not (:geschichte.commit/snapshot commit)
-        (throw (ex-info "Unknown Geschichte commit" {:commit commit})))
-      (stage-map (await (snapshot-db conn commit)))))))
+  ([conn] (tree conn :head))
+  ([conn commit] (tree conn commit)))
 
 (defn read-at [conn commit path]
   (platform-async
-   (let [commit (cond
-                  (map? commit) commit
-                  (uuid? commit)
-                  (d/pull @conn [:geschichte.commit/id
-                                 :geschichte.commit/snapshot]
-                          [:geschichte.commit/id commit])
-                  :else nil)]
-     (when-not (:geschichte.commit/snapshot commit)
-       (throw (ex-info "Unknown Geschichte commit" {:commit commit})))
-     (let [snapshot (await (snapshot-db conn commit))
-           id (get-in (stage-map snapshot)
-                      [(normalize-path path) :content])]
-       (when id
-         ;; Resolve content metadata from the immutable commit snapshot, not
-         ;; from the caller's current branch. Published workspace commits are
-         ;; intentionally absent from the canonical mutable catalog; their
-         ;; snapshot and store-ref payload graph remain reachable via Datahike
-         ;; merge ancestry.
-         (await (content/read-by-id (atom snapshot) id)))))))
+   (let [{:keys [db tree]} (await (source-view conn commit))]
+     (when-let [id (get-in tree [(normalize-path path) :content])]
+       (await (content/read-by-id (atom db) id))))))
 
 (defn write!
   "Write bytes into the working tree through the delta representation layer."
@@ -719,7 +741,8 @@
       (throw (ex-info "Restore needs --staged or --worktree" {})))
     (let [paths (mapv normalize-path paths)
           source (or source (if staged? :head :index))
-          tree (await (tree conn source))
+          view (await (source-view conn source))
+          tree (:tree view)
           db @conn
           replace-selected (fn [target]
                              (merge (apply dissoc target paths) (select-keys tree paths)))
@@ -738,6 +761,7 @@
                    (concat (retract-paths-tx @conn :geschichte.stage/path [path])
                            (when entry [(stage-entry-tx path entry)]))))))
             paths))]
+      (await (ensure-tree-content! conn (select-keys tree paths) (fn [_ _] (:db view))))
       (when (seq tx-data) (await (transact-data conn tx-data)))
       paths))))
 
@@ -763,7 +787,8 @@
           _ (when (and second-parent (= :soft mode))
               (throw (ex-info "Cannot do a soft reset while a merge is pending"
                               {:type ::pending-merge-soft-reset})))
-          tree (await (tree-at conn commit))
+          view (await (source-view conn commit))
+          tree (:tree view)
           current-ref-name (current-ref conn)
           current-tracked (set (keys (query/stage @conn)))
           target-paths (set (keys tree))
@@ -787,6 +812,8 @@
                          [[:db/retract (:db/id (query/repository @conn))
                            :geschichte.repo/merge-parent (:db/id second-parent)]])
           tx-data (vec (concat [ref-tx] index-tx work-tx cancel-merge))]
+      (when (#{:mixed :hard} mode)
+        (await (ensure-tree-content! conn tree (fn [_ _] (:db view)))))
       (await (transact-data conn tx-data))
       (:geschichte.commit/id commit)))))
 
@@ -871,9 +898,8 @@
           current-status (await (status conn))
           second-parent (merge-parent conn)
           commit (:geschichte.ref/target ref)
-          tree (if commit
-                 (stage-map (await (snapshot-db conn commit)))
-                 {})
+          view (await (source-view conn (or commit :empty)))
+          tree (:tree view)
           conflicting-untracked
           (set/intersection (set (:untracked current-status))
                             (set (keys tree)))]
@@ -900,6 +926,7 @@
                    (when second-parent
                      [[:db/retract (:db/id (query/repository @conn))
                        :geschichte.repo/merge-parent (:db/id second-parent)]])))]
+        (await (ensure-tree-content! conn tree (fn [_ _] (:db view))))
         (await (transact-data conn tx-data))
         name)))))
 

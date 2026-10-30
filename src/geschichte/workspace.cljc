@@ -296,7 +296,7 @@
                      [:geschichte.content/id base-id])
       (seq chunks) (assoc :geschichte.content/chunks chunks))))
 
-(defn- transfer-data [source target commits tip tree]
+(defn- transfer-data [content-source target commits tip tree]
   (let [reachable (reachable-ids commits tip)
         target-commits (set (map :geschichte.commit/id
                                  (query/commits target)))
@@ -308,7 +308,7 @@
                                    :where [_ :geschichte.content/id ?id]]
                                  target))
         tree-content (keep (comp :content val) tree)
-        copied-content (->> (content-closure source tree-content)
+        copied-content (->> (content-closure content-source tree-content)
                             (clojure.core/remove
                              #(contains? target-content
                                          (:geschichte.content/id %)))
@@ -394,7 +394,9 @@
                               {:type ::invalid-publication-options})))
           canonical-db @canonical
           _ (when expected-checkpoint (guarded-publication-tx canonical-db expected-checkpoint []))
-          ref (normalize-ref (or ref (repo/current-ref workspace)))
+          source-db @workspace
+          source (atom source-db)
+          ref (normalize-ref (or ref (repo/current-ref source)))
           canonical-ref (get (query/refs canonical-db) ref ::missing)
           _ (when (and create-only? (not= ::missing canonical-ref))
               (throw (ex-info "Create-only publication requires an absent ref"
@@ -403,8 +405,8 @@
               (throw (ex-info "Canonical ref does not exist"
                               {:ref ref})))
           canonical-ref (when-not (= ::missing canonical-ref) canonical-ref)
-          commits (commit-index @workspace)
-          tip (or commit (get (repo/refs workspace) ref))
+          commits (commit-index source-db)
+          tip (or commit (get (repo/refs source) ref))
           tip (if (map? tip) (:geschichte.commit/id tip) tip)
           _ (when-not (contains? commits tip)
               (throw (ex-info "Workspace ref has no publishable commit"
@@ -414,8 +416,9 @@
                        (not (contains? reachable canonical-ref)))
               (throw (ex-info "Publication is not a fast-forward"
                               {:ref ref :expected canonical-ref :new tip})))
-          tree (await (repo/tree-at workspace tip))
-          transfer (transfer-data @workspace canonical-db commits tip tree)
+          view (await (repo/source-view (atom source-db) tip))
+          tree (:tree view)
+          transfer (transfer-data (:db view) canonical-db commits tip tree)
           ref-entity (d/q '[:find ?ref .
                             :in $ ?name
                             :where [?ref :geschichte.ref/name ?name]]
@@ -431,7 +434,7 @@
 
                        :else
                        [:db.fn/call update-publication-ref-tx ref ref-entity canonical-ref tip])
-          workspace-head (d/commit-id @workspace)
+          workspace-head (d/commit-id source-db)
           tx-data (conj (:tx-data transfer) ref-update)
           tx-data (if expected-checkpoint
                     [[:db.fn/call guarded-publication-tx expected-checkpoint tx-data]]
@@ -555,14 +558,15 @@
           _ (when (and old (not (contains? reachable old)))
               (throw (ex-info "Workspace advance is not a fast-forward"
                               {:ref ref :old old :new tip})))
-          tree (await (repo/tree-at source tip))
+          view (await (repo/source-view source tip))
+          tree (:tree view)
           conflicting-untracked (set/intersection
                                  (set (:untracked status))
                                  (set (keys tree)))
           _ (when (seq conflicting-untracked)
               (throw (ex-info "Workspace advance would overwrite untracked files"
                               {:ref ref :paths conflicting-untracked})))
-          transfer (transfer-data source-db target-db source-commits tip tree)
+          transfer (transfer-data (:db view) target-db source-commits tip tree)
           ref-eid (d/q '[:find ?ref .
                          :in $ ?name
                          :where [?ref :geschichte.ref/name ?name]]

@@ -87,7 +87,7 @@
         (workspace/fork! canonical "publisher")
         (let [worker (d/connect (assoc cfg :branch :geschichte.workspace/publisher))
               after-change (atom nil)
-              tree-at repo/tree-at]
+              source-view repo/source-view]
           (try
             (repo/branch! worker "topic")
             (when (#{:delete-existing :recreate-existing :rename-existing} interleaving)
@@ -95,7 +95,7 @@
             (when (= :delete-unborn interleaving)
               (d/transact canonical [{:geschichte.ref/name "refs/heads/topic"}]))
             (let [failure
-                  (with-redefs [repo/tree-at
+                  (with-redefs [repo/source-view
                                 (fn [conn commit]
                                   (cond
                                     (= :create-unborn interleaving)
@@ -110,7 +110,7 @@
                                             (when (= :recreate-existing interleaving)
                                               (repo/branch! canonical "topic"))))
                                   (reset! after-change @canonical)
-                                  (tree-at conn commit))]
+                                  (source-view conn commit))]
                     (try (workspace/publish! canonical worker
                                              {:ref "topic" :create? (= :create-unborn interleaving)})
                          nil (catch Exception error error)))]
@@ -127,12 +127,12 @@
       (repo/branch! canonical "topic")
       (workspace/fork! canonical "publisher")
       (let [worker (d/connect (assoc cfg :branch :geschichte.workspace/publisher))
-            tree-at repo/tree-at]
+            source-view repo/source-view]
         (try
-          (let [result (with-redefs [repo/tree-at
+          (let [result (with-redefs [repo/source-view
                                      (fn [conn commit]
                                        (repo/delete-branch! canonical "topic" {:force? true})
-                                       (tree-at conn commit))]
+                                       (source-view conn commit))]
                          (workspace/publish! canonical worker {:ref "topic" :force? true}))]
             (is (:forced? result))
             (is (= (:new result) (get (repo/refs canonical) "refs/heads/topic"))))
@@ -198,10 +198,10 @@
           (repo/stage-all! canonical)
           (let [tip (:geschichte.commit/id (repo/commit! canonical {:message "remote"}))
                 checkpoint (d/commit-id @canonical)
-                tree-at repo/tree-at
-                result (with-redefs [repo/tree-at
+                source-view repo/source-view
+                result (with-redefs [repo/source-view
                                      (fn [conn commit]
-                                       (let [tree (tree-at conn commit)]
+                                       (let [tree (source-view conn commit)]
                                          (repo/write! canonical "base.txt" (->bytes "later\n"))
                                          (repo/stage-all! canonical)
                                          (repo/commit! canonical {:message "later"})

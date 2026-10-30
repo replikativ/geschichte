@@ -92,20 +92,12 @@
    content is added; no HEAD, worktree or index changes during planning."
   [conn result views trees operation]
   (when (:clean? result)
-    (doseq [[path {:keys [content size] :as entry}] (:tree result)]
-      (budget/check! operation)
-      (when-not (d/q '[:find ?e . :in $ ?id :where [?e :geschichte.content/id ?id]] @conn content)
-        (let [source (some (fn [[view tree]] (when (= entry (get tree path)) view)) (map vector views trees))]
-          (when-not source (throw (ex-info "Merge result has no content source" {:path path :content content})))
-          (let [value (content/read-by-id (reify clojure.lang.IDeref (deref [_] source)) content
-                                          {:sync? true :merge-budget operation :read-db source})]
-            (when-not (= size (alength ^bytes value))
-              (throw (ex-info "Historical merge content size mismatch" {:path path})))
-            (budget/charge! operation :merge-output-bytes size)
-            (budget/check! operation)
-            (when-not (= content (content/transact-content! conn value nil (constantly []) {:sync? true}))
-              (throw (ex-info "Historical merge content identity mismatch" {:path path})))
-            (budget/check! operation))))))
+    (repo/ensure-tree-content!
+     conn (:tree result)
+     (fn [path entry]
+       (some (fn [[view tree]] (when (= entry (get tree path)) view))
+             (map vector views trees)))
+     {:merge-budget operation}))
   result)
 
 (defn ancestor-distances
