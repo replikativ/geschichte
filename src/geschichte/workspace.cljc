@@ -346,6 +346,12 @@
   [[:db.fn/cas eid :geschichte.ref/target
     (when old [:geschichte.commit/id old]) [:geschichte.commit/id tip]]])
 
+(defn publication-profile
+  "Positive compatibility marker: consumers must not send create-only options
+  to an older runtime that could ignore them. This grants no publication rights."
+  []
+  {:id ::guarded-publication :version 1 :create-only? true})
+
 (defn publish!
   "Publish one logical workspace ref into a canonical Geschichte connection.
 
@@ -353,7 +359,10 @@
   ref again inside the serialized Datahike merge transaction, and newly created
   refs validate absence there, so concurrent publishers cannot silently
   overwrite each other. `:force? true` permits a
-  deliberate non-fast-forward update.
+  deliberate non-fast-forward update. `:create-only? true` requires a missing
+  ref and validates that absence again in the serialized transaction; it also
+  allows creation without `:create?`. Existing refs, including unborn refs or
+  the same tip, refuse. It cannot be combined with `:force?`.
 
   Only reachable immutable commit metadata and the selected ref are copied to
   the canonical current DB. The workspace's worktree, index, config, and other
@@ -361,13 +370,19 @@
   keeps every published Geschichte snapshot and store-ref blob reachable after
   the physical workspace branch is removed."
   ([canonical workspace] (publish! canonical workspace {}))
-  ([canonical workspace {:keys [ref commit force? create?]
-                         :or {force? false create? false}}]
+  ([canonical workspace {:keys [ref commit force? create? create-only?]
+                         :or {force? false create? false create-only? false}}]
    (platform-async
-    (let [ref (normalize-ref (or ref (repo/current-ref workspace)))
+    (let [_ (when (and force? create-only?)
+              (throw (ex-info "Create-only publication cannot force an existing ref"
+                              {:type ::invalid-publication-options})))
+          ref (normalize-ref (or ref (repo/current-ref workspace)))
           canonical-db @canonical
           canonical-ref (get (query/refs canonical-db) ref ::missing)
-          _ (when (and (= ::missing canonical-ref) (not create?))
+          _ (when (and create-only? (not= ::missing canonical-ref))
+              (throw (ex-info "Create-only publication requires an absent ref"
+                              {:type ::publication-ref-exists :ref ref})))
+          _ (when (and (= ::missing canonical-ref) (not (or create? create-only?)))
               (throw (ex-info "Canonical ref does not exist"
                               {:ref ref})))
           canonical-ref (when-not (= ::missing canonical-ref) canonical-ref)
@@ -403,13 +418,14 @@
           tx-data (conj (:tx-data transfer) ref-update)]
       (path-tree/assert-valid! tree)
       (await (merge-data canonical #{workspace-head} tx-data))
-      {:ref ref
-       :old canonical-ref
-       :new tip
-       :copied-commits (count (:copied-commits transfer))
-       :copied-content (count (:copied-content transfer))
-       :workspace-commit workspace-head
-       :forced? force?}))))
+      (cond-> {:ref ref
+               :old canonical-ref
+               :new tip
+               :copied-commits (count (:copied-commits transfer))
+               :copied-content (count (:copied-content transfer))
+               :workspace-commit workspace-head
+               :forced? force?}
+        create-only? (assoc :created? true))))))
 
 (defn- retract-entities [db attr]
   (mapv (fn [[eid]] [:db/retractEntity eid])

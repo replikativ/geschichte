@@ -367,3 +367,64 @@
               (is (= old (repo/refs observer)))))
           (finally (d/release observer))))
       (finally (cleanup f)))))
+
+(deftest create-only-publication-refuses-all-existing-refs
+  (let [{:keys [cfg canonical] :as f} (fixture)]
+    (try
+      (workspace/fork! canonical "only-publisher")
+      (let [worker (d/connect (assoc cfg :branch :geschichte.workspace/only-publisher))]
+        (try
+          (repo/write! worker "candidate.txt" (->bytes "candidate\n"))
+          (repo/stage-all! worker)
+          (let [tip (:geschichte.commit/id (repo/commit! worker {:message "candidate"}))
+                before-files (repo/worktree canonical)
+                result (workspace/publish! canonical worker {:ref "review" :commit tip :create-only? true})]
+            (is (true? (:created? result)))
+            (is (nil? (:old result)))
+            (is (= tip (:new result)))
+            (is (= before-files (repo/worktree canonical)))
+            (repo/branch! canonical "existing-review")
+            (d/transact canonical [{:geschichte.ref/name "refs/heads/unborn-review"}])
+            (doseq [ref ["review" "existing-review" "unborn-review"]]
+              (let [before @canonical
+                    failure (try (workspace/publish! canonical worker {:ref ref :commit tip :create-only? true})
+                                 nil (catch Exception e e))]
+                (is (= ::workspace/publication-ref-exists (:type (ex-data failure))))
+                (is (= before @canonical)))))
+          (finally (d/release worker))))
+      (finally (cleanup f)))))
+
+(deftest create-only-cannot-be-combined-with-force-before-source-access
+  (is (= ::workspace/invalid-publication-options
+         (:type (ex-data (try (workspace/publish! nil nil {:create-only? true :force? true})
+                              nil (catch Exception e e)))))))
+
+(deftest create-only-publication-refuses-a-racing-unborn-ref-in-the-writer
+  (let [{:keys [cfg canonical] :as f} (fixture)]
+    (try
+      (workspace/fork! canonical "only-publisher")
+      (let [worker (d/connect (assoc cfg :branch :geschichte.workspace/only-publisher))
+            merge-var (ns-resolve 'geschichte.workspace 'merge-data)
+            merge-data @merge-var after-creation (atom nil)]
+        (try
+          (repo/write! worker "candidate.txt" (->bytes "candidate\n"))
+          (repo/stage-all! worker)
+          (let [tip (:geschichte.commit/id (repo/commit! worker {:message "candidate"}))
+                failure (with-redefs-fn
+                          {merge-var (fn [conn parents tx]
+                                       (d/transact canonical [{:geschichte.ref/name "refs/heads/review"}])
+                                       (reset! after-creation @canonical)
+                                       (merge-data conn parents tx))}
+                          #(try (workspace/publish! canonical worker
+                                                    {:ref "review" :commit tip :create-only? true})
+                                nil (catch Exception e e)))]
+            (is (= ::workspace/publication-ref-exists (:type (ex-data failure))))
+            (is (= @after-creation @canonical) "The losing transfer is rolled back with its ref update")
+            (is (contains? (repo/refs canonical) "refs/heads/review"))
+            (is (nil? (get (repo/refs canonical) "refs/heads/review"))))
+          (finally (d/release worker))))
+      (finally (cleanup f)))))
+
+(deftest publication-profile-positively-identifies-the-create-only-contract
+  (is (= {:id ::workspace/guarded-publication :version 1 :create-only? true}
+         (workspace/publication-profile))))

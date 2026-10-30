@@ -27,6 +27,21 @@ canonical :db (publication authority)
 (ws/remove! canonical "agent-a")
 ```
 
+For an immutable review ref, use create-only publication:
+
+```clojure
+(ws/publish! canonical agent {:ref "refs/heads/review-123"
+                              :commit candidate-id :create-only? true})
+```
+
+Consumers can check `ws/publication-profile` before sending the new option to
+a dynamically selected runtime; older libraries can ignore unknown options.
+This requires the ref to be absent, including in the serialized publication
+transaction. An existing unborn ref or the same tip also refuses; a concurrent
+creator wins without its ref or metadata being overwritten. Successful return
+includes `:created? true`. `:create? true` continues to allow either creation or
+an ordinary fast-forward update. Create-only publication cannot force an update.
+
 Publication transfers reachable immutable commit/content metadata and atomically
 advances the canonical logical ref. It does not copy workspace-private config,
 uncommitted files, staging state, or unrelated refs. Advance is explicit and
