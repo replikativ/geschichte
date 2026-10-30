@@ -36,11 +36,18 @@ For an immutable review ref, use create-only publication:
 
 Consumers can check `ws/publication-profile` before sending the new option to
 a dynamically selected runtime; older libraries can ignore unknown options.
-This requires the ref to be absent, including in the serialized publication
+Create-only publication requires the ref to be absent, including in the serialized publication
 transaction. An existing unborn ref or the same tip also refuses; a concurrent
 creator wins without its ref or metadata being overwritten. Successful return
 includes `:created? true`. `:create? true` continues to allow either creation or
 an ordinary fast-forward update. Create-only publication cannot force an update.
+
+For a target snapshot that has already been inspected or checked against
+resource bounds, also pass `:expected-checkpoint (d/commit-id @canonical)` from
+that same immutable snapshot. A mismatch refuses before metadata projection;
+any later change refuses in the serialized writer and rolls back the whole
+publication. `publication-profile` positively identifies support for this guard.
+The caller still owns the source workspace exclusively throughout preparation.
 
 Publication transfers reachable immutable commit/content metadata and atomically
 advances the canonical logical ref. It does not copy workspace-private config,

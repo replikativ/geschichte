@@ -88,6 +88,7 @@
                                     (<! (take-cps
                                          (workspace/publish! canonical worker
                                                              {:ref "node-review" :create-only? true
+                                                              :expected-checkpoint (d/commit-id @canonical)
                                                               :commit (:geschichte.commit/id commit)}))))
                            before @canonical
                            failure (try
@@ -214,4 +215,16 @@
                               (<! (take-cps (workspace/publish! nil nil {:create-only? true :force? true}))))
                              nil (catch :default error error))]
                (is (= ::workspace/invalid-publication-options (:type (ex-data failure)))))
+             (finally (done))))))
+
+(deftest node-invalid-publication-checkpoint-refuses-before-source-access
+  (async done
+         (go
+           (try
+             (doseq [value [nil "invalid"]]
+               (let [failure (try
+                               (bridge/unwrap-result
+                                (<! (take-cps (workspace/publish! nil nil {:expected-checkpoint value}))))
+                               nil (catch :default error error))]
+                 (is (= ::workspace/invalid-publication-options (:type (ex-data failure))))))
              (finally (done))))))
