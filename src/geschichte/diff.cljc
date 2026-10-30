@@ -8,7 +8,8 @@
    The public representation is a sequence of coalesced edits with half-open
    coordinates in both inputs.  Rendering is a separate concern, so comparison
    normalisation (ignore-case/whitespace, later gitattributes-style drivers)
-   never destroys the original text shown to a user.")
+   never destroys the original text shown to a user."
+  (:require [geschichte.budget :as budget]))
 
 (def ^:private default-max-trace-cells
   ;; Myers' ordinary case is excellent, but retaining every frontier for
@@ -78,15 +79,25 @@
            :a-start nil :a-count suffix
            :b-start nil :b-count suffix})))
 
+(defn- equal-line? [operation a b]
+  (budget/charge! operation :text-work (max 1 (if (string? a) (count a) 1) (if (string? b) (count b) 1)))
+  (= a b))
+
+(defn- trace-copy [operation buf width]
+  (budget/charge! operation :text-trace-cells width)
+  (budget/charge! operation :text-work width)
+  (buffer-copy buf))
+
 (defn- coalesce-steps
   "Turn source-order unit steps into coordinate ranges."
-  [steps a-offset b-offset]
+  [steps a-offset b-offset operation]
   (loop [remaining steps
          a-pos a-offset
          b-pos b-offset
          edits []]
     (if-let [op (first remaining)]
-      (let [a-step (if (#{:equal :delete} op) 1 0)
+      (let [_ (budget/charge! operation :text-work 1)
+            a-step (if (#{:equal :delete} op) 1 0)
             b-step (if (#{:equal :insert} op) 1 0)
             prior (peek edits)]
         (if (= op (:op prior))
@@ -114,26 +125,31 @@
   "Myers frontier search over `a` and `b`, returning unit steps in source order.
    Retains frontiers for backtracking and falls back to replace-all once the
    configured trace budget would be exceeded."
-  [a b max-trace-cells]
-  (let [a-data #?(:clj (object-array a) :cljs a)
-        b-data #?(:clj (object-array b) :cljs b)
-        n (count a)
+  [a b max-trace-cells operation]
+  (let [n (count a)
         m (count b)
         max-d (+ n m)
         ;; One sentinel diagonal on either side avoids special storage cases at
         ;; d=0 and at the outermost frontier.
         offset (inc max-d)
         width (+ 3 (* 2 max-d))
+        _ (budget/bound! operation :text-frontier-cells width)
+        _ (budget/charge! operation :text-work (+ n m width))
+        a-data #?(:clj (object-array a) :cljs a)
+        b-data #?(:clj (object-array b) :cljs b)
         v (int-buffer width)]
     (loop [d 0
            trace []]
       (if (or (> (* (inc d) width) max-trace-cells)
               (> d max-d))
-        (fallback-steps n m)
+        (if operation
+          (budget/exceed! operation :text-trace-cells max-trace-cells (* (inc d) width))
+          (fallback-steps n m))
         (let [done
               (loop [k (- d)]
                 (when (<= k d)
-                  (let [idx (+ offset k)
+                  (let [_ (budget/charge! operation :text-work 1)
+                        idx (+ offset k)
                         down? (or (= k (- d))
                                   (and (not= k d)
                                        (< (bget v (dec idx))
@@ -147,10 +163,10 @@
                         y0 (- x0 k)
                         [x y] (loop [x x0 y y0]
                                 (if (and (< x n) (< y m)
-                                         (= #?(:clj (aget ^objects a-data x)
-                                               :cljs (nth a-data x))
-                                            #?(:clj (aget ^objects b-data y)
-                                               :cljs (nth b-data y))))
+                                         (equal-line? operation #?(:clj (aget ^objects a-data x)
+                                                                   :cljs (nth a-data x))
+                                                      #?(:clj (aget ^objects b-data y)
+                                                         :cljs (nth b-data y))))
                                   (recur (inc x) (inc y))
                                   [x y]))]
                     (bset! v idx x)
@@ -158,8 +174,8 @@
                       true
                       (recur (+ k 2))))))]
           (if-not done
-            (recur (inc d) (conj trace (buffer-copy v)))
-            (let [trace' (conj trace (buffer-copy v))]
+            (recur (inc d) (conj trace (trace-copy operation v width)))
+            (let [trace' (conj trace (trace-copy operation v width))]
               (loop [depth d
                      x n
                      y m
@@ -168,10 +184,12 @@
                   (let [reversed
                         (loop [x x y y acc reversed]
                           (if (and (pos? x) (pos? y))
-                            (recur (dec x) (dec y) (conj! acc :equal))
+                            (do (budget/charge! operation :text-work 1)
+                                (recur (dec x) (dec y) (conj! acc :equal)))
                             acc))]
                     (vec (reverse (persistent! reversed))))
-                  (let [previous (nth trace' (dec depth))
+                  (let [_ (budget/charge! operation :text-work 1)
+                        previous (nth trace' (dec depth))
                         k (- x y)
                         idx (+ offset k)
                         prev-k (if (or (= k (- depth))
@@ -185,7 +203,8 @@
                         [x' _ reversed']
                         (loop [sx x sy y acc reversed]
                           (if (and (> sx prev-x) (> sy prev-y))
-                            (recur (dec sx) (dec sy) (conj! acc :equal))
+                            (do (budget/charge! operation :text-work 1)
+                                (recur (dec sx) (dec sy) (conj! acc :equal)))
                             [sx sy acc]))
                         insertion? (= x' prev-x)]
                     (recur (dec depth)
@@ -204,31 +223,32 @@
    Returns coalesced half-open edit ranges. Equal ranges can contain different
    original strings when `:normalize` considers them equal."
   ([a-lines b-lines] (diff-lines a-lines b-lines nil))
-  ([a-lines b-lines {:keys [normalize max-trace-cells a-keys b-keys]
+  ([a-lines b-lines {:keys [normalize max-trace-cells a-keys b-keys merge-budget]
                      :or {normalize identity
                           max-trace-cells default-max-trace-cells}}]
-   (let [a-lines (vec a-lines)
+   (let [_ (budget/charge! merge-budget :text-work (+ (count a-lines) (count b-lines)))
+         a-lines (vec a-lines)
          b-lines (vec b-lines)
          a (or a-keys (mapv normalize a-lines))
          b (or b-keys (mapv normalize b-lines))
          n (count a)
          m (count b)
          prefix (loop [i 0]
-                  (if (and (< i n) (< i m) (= (nth a i) (nth b i)))
+                  (if (and (< i n) (< i m) (equal-line? merge-budget (nth a i) (nth b i)))
                     (recur (inc i))
                     i))
          suffix (loop [i 0]
                   (if (and (< i (- n prefix))
                            (< i (- m prefix))
-                           (= (nth a (- n i 1)) (nth b (- m i 1))))
+                           (equal-line? merge-budget (nth a (- n i 1)) (nth b (- m i 1))))
                     (recur (inc i))
                     i))
          a-end (- n suffix)
          b-end (- m suffix)
          middle-a (subvec a prefix a-end)
          middle-b (subvec b prefix b-end)
-         steps (myers-steps middle-a middle-b max-trace-cells)
-         middle (coalesce-steps steps prefix prefix)
+         steps (myers-steps middle-a middle-b max-trace-cells merge-budget)
+         middle (coalesce-steps steps prefix prefix merge-budget)
          edits (prepend-prefix-suffix middle prefix suffix)
          edits (if (pos? suffix)
                  (assoc-in edits [(dec (count edits)) :a-start] a-end)

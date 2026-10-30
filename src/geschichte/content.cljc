@@ -7,6 +7,8 @@
             [datahike.gc-guard :as guard]
             [geschichte.async :as execution]
             [geschichte.bytes :as bytes]
+            [geschichte.budget :as budget]
+            [geschichte.merge.delta :as merge-delta]
             [geschichte.chunk :as chunk]
             [geschichte.diff :as diff]
             [geschichte.store.blob :as payload]
@@ -54,6 +56,21 @@
          :in $ ?id
          :where [?e :geschichte.content/id ?id]]
        db id))
+
+(defn- bounded-content-entity [db id operation]
+  (when-let [entity (d/pull db [:db/id :geschichte.content/id
+                                :geschichte.content/kind :geschichte.content/payload
+                                :geschichte.content/depth :geschichte.content/size
+                                {:geschichte.content/base [:geschichte.content/id]}]
+                            [:geschichte.content/id id])]
+    (let [chunks
+          (reduce (fn [out datom]
+                    (budget/charge! operation :content-parts 1)
+                    (conj out (d/pull db [:geschichte.chunk/index :geschichte.chunk/offset
+                                          :geschichte.chunk/payload :geschichte.chunk/size]
+                                      (:v datom))))
+                  [] (d/datoms db :eavt (:db/id entity) :geschichte.content/chunks))]
+      (assoc entity :geschichte.content/chunks chunks))))
 
 (defn- ordered-chunks [entity]
   (sort-by :geschichte.chunk/index (:geschichte.content/chunks entity)))
@@ -118,17 +135,18 @@
                       (payload/get-bytes
                        conn (:geschichte.content/payload entity) opts))]
                  (case (:geschichte.content/kind entity)
-                   :full stored
+                   :full (do (budget/charge! (:merge-budget opts) :content-decoded-bytes (bytes/length stored)) stored)
                    :chunks
                    (loop [remaining (seq (ordered-chunks entity))
-                          values []]
+                          values [] size 0]
                      (if-let [chunk (first remaining)]
-                       (recur (next remaining)
-                              (conj values
-                                    (await
-                                     (checked-payload
-                                      conn (:geschichte.chunk/payload chunk) opts))))
-                       (apply bytes/concat-bytes values)))
+                       (let [value (await (checked-payload conn (:geschichte.chunk/payload chunk) opts))
+                             n (bytes/length value)]
+                         (budget/bound! (:merge-budget opts) :object-bytes (+ size n))
+                         (budget/charge! (:merge-budget opts) :content-decoded-bytes n)
+                         (recur (next remaining) (conj values value) (+ size n)))
+                       (do (budget/check! (:merge-budget opts))
+                           (apply bytes/concat-bytes values))))
                    :line-delta
                    (let [base-id
                          (get-in entity
@@ -136,8 +154,10 @@
                                   :geschichte.content/id])
                          base (strict-utf8
                                (await (read-by-id conn base-id opts)))
-                         delta (edn/read-string (bytes/decode-utf8 stored))]
-                     (bytes/utf8 (apply-line-delta base delta)))
+                         text (if (:merge-budget opts) (bytes/decode-utf8-strict stored) (bytes/decode-utf8 stored))]
+                     (if-let [operation (:merge-budget opts)]
+                       (bytes/utf8 (merge-delta/decode operation base text))
+                       (bytes/utf8 (apply-line-delta base (edn/read-string text)))))
                    (throw (ex-info "Unknown content representation"
                                    {:content (:geschichte.content/id entity)
                                     :kind (:geschichte.content/kind entity)})))))))
@@ -149,15 +169,29 @@
   partial-cps computation; pass execution options explicitly when composing."
   ([conn id] (read-by-id conn id nil))
   ([conn id provided-opts]
-   (let [opts (execution/opts provided-opts)]
+   (let [opts (execution/opts provided-opts)
+         operation (:merge-budget opts)
+         opts (if operation (assoc opts :read-db (or (:read-db opts) @conn)) opts)]
      (when id
+       (when operation
+         (budget/charge! operation :content-visits 1)
+         (budget/bound! operation :content-depth (inc (or (:content-depth opts) 0)))
+         (when (contains? (:content-seen opts) id)
+           (throw (ex-info "Cyclic content representation" {:type ::content-cycle :content id}))))
        (async+sync (:sync? opts)
                    (async
-                    (let [entity (or (content-entity @conn id)
+                    (let [opts (if operation
+                                 (-> opts (update :content-depth (fnil inc 0))
+                                     (update :content-seen (fnil conj #{}) id)) opts)
+                          entity (or (if operation
+                                       (bounded-content-entity (:read-db opts) id operation)
+                                       (content-entity @conn id))
                                      (throw (ex-info "Unknown content"
                                                      {:content id})))
+                          _ (budget/bound! operation :object-bytes (:geschichte.content/size entity))
                           value (await (decode conn entity opts))
-                          actual (blob/blob-id value)]
+                          actual (blob/blob-id value)
+                          _ (budget/check! operation)]
                       (when-not (= id actual)
                         (throw (ex-info "Content hash mismatch"
                                         {:content id :actual actual})))

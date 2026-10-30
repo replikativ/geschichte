@@ -1,7 +1,8 @@
 (ns geschichte.merge.core
   "Pure, platform-neutral commit-graph and three-tree merge semantics."
   (:require [clojure.set :as set]
-            [geschichte.tree :as tree]))
+            [geschichte.tree :as tree]
+            [geschichte.budget :as budget]))
 
 (def ^:private absent ::absent)
 
@@ -88,29 +89,35 @@
   ([base-id ours-id theirs-id base-tree ours-tree theirs-tree]
    (plan-trees base-id ours-id theirs-id base-tree ours-tree theirs-tree nil))
   ([base-id ours-id theirs-id base-tree ours-tree theirs-tree
-    {:keys [resolve-content]}]
-   (doseq [input [base-tree ours-tree theirs-tree]] (tree/assert-valid! input))
-   (let [paths (sort (set/union (set (keys base-tree))
-                                (set (keys ours-tree))
-                                (set (keys theirs-tree))))
+    {:keys [resolve-content merge-budget]}]
+   (doseq [input [base-tree ours-tree theirs-tree]] (tree/assert-valid! input [] merge-budget))
+   (let [comparator (fn [a b]
+                      (budget/charge! merge-budget :text-work (max (count a) (count b)))
+                      (compare a b))
+         paths (sort comparator (set/union (set (keys base-tree))
+                                           (set (keys ours-tree))
+                                           (set (keys theirs-tree))))
          resolutions
          (mapv (fn [path]
+                 (budget/charge! merge-budget :text-work 1)
                  (resolve-path path
                                (get base-tree path absent)
                                (get ours-tree path absent)
                                (get theirs-tree path absent)
                                resolve-content))
                paths)
-         conflicts (into (sorted-map)
+         conflicts (into (if merge-budget (sorted-map-by comparator) (sorted-map))
                          (keep (fn [{:keys [path conflict]}]
                                  (when conflict [path conflict])))
                          resolutions)
-         tree (into (sorted-map)
+         tree (into (if merge-budget (sorted-map-by comparator) (sorted-map))
                     (keep (fn [{:keys [path value conflict]}]
                             (when (and (nil? conflict) (not= value absent))
+                              (budget/bound! merge-budget :object-bytes (:size value))
+                              (budget/charge! merge-budget :result-tree-bytes (:size value))
                               [path value])))
                     resolutions)
-         structural (tree/prefix-conflicts (keys tree))
+         structural (tree/prefix-conflicts (keys tree) merge-budget)
          structural-index (reduce (fn [result [ancestor descendant]]
                                     (-> result
                                         (update ancestor (fnil into (sorted-set)) [ancestor descendant])
@@ -125,15 +132,25 @@
                                      :ours (get ours-tree path absent)
                                      :theirs (get theirs-tree path absent)}))
                            conflicts structural-paths)
-         tree (apply dissoc tree structural-paths)]
-     {:kind (cond (= ours-id theirs-id) :up-to-date
-                  (= base-id ours-id) :fast-forward
-                  :else :merge)
-      :base base-id :ours ours-id :theirs theirs-id
-      :tree tree :conflicts conflicts :clean? (empty? conflicts)
+         tree (apply dissoc tree structural-paths)
+         merged-paths (into [] (keep (fn [{:keys [path merged?]}]
+                                       (when (and merged? (not (contains? structural-paths path))) path)))
+                            resolutions)
+         _ (when merge-budget
+             (let [n (+ (count tree) (count conflicts) (count merged-paths))
+                   height (* 2 (inc #?(:clj (long (Math/ceil (/ (Math/log (inc n)) (Math/log 2))))
+                                       :cljs (js/Math.ceil (/ (js/Math.log (inc n)) (js/Math.log 2))))))
+                   chars (reduce + (map count (concat (keys tree) (keys conflicts) merged-paths)))]
+               (budget/charge! merge-budget :text-work (* height chars))))]
+     (let [result {:kind (cond (= ours-id theirs-id) :up-to-date
+                               (= base-id ours-id) :fast-forward
+                               :else :merge)
+                   :base base-id :ours ours-id :theirs theirs-id
+                   :tree (if merge-budget (into (sorted-map) tree) tree)
+                   :conflicts (if merge-budget (into (sorted-map) conflicts) conflicts) :clean? (empty? conflicts)
      ;; the paths a content merge settled — a caller writing a merge commit
      ;; message, or a reviewer, wants to know which files were reconciled
      ;; rather than taken wholesale from one side
-      :merged (into (sorted-set) (keep (fn [{:keys [path merged?]}]
-                                         (when (and merged? (not (contains? structural-paths path))) path))
-                                       resolutions))})))
+                   :merged (into (sorted-set) merged-paths)}]
+       (budget/check! merge-budget)
+       result))))

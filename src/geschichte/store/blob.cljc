@@ -4,6 +4,7 @@
   (:require [datahike.blob :as blob]
             [geschichte.async :as execution]
             [geschichte.bytes :as bytes]
+            [geschichte.budget :as budget]
             [is.simm.partial-cps.async :refer [await]]
             [konserve.core :as k]
             #?(:cljs [cljs.core.async :as core-async]))
@@ -11,7 +12,8 @@
                             [is.simm.partial-cps.async :refer [async]]))
   #?(:clj (:require [geschichte.macros :refer [async+sync]]
                     [is.simm.partial-cps.async :refer [async]]))
-  #?(:clj (:import [java.util.concurrent Callable CancellationException
+  #?(:clj (:import [java.io ByteArrayOutputStream InputStream]
+                   [java.util.concurrent Callable CancellationException
                     ExecutionException ExecutorService Executors Future])))
 
 (def default-write-parallelism 4)
@@ -106,13 +108,33 @@
                                 (conj ids (await (put! conn value opts))))
                          ids))))))))
 
+(defn- account-read! [operation size]
+  (budget/bound! operation :object-bytes size)
+  (budget/charge! operation :content-read-bytes size))
+
 #?(:clj
-   (defn- sync-binary [{:keys [input-stream blob] :as value}]
+   (defn- bounded-stream [^InputStream input operation]
+     (let [scratch (byte-array 8192)
+           output (ByteArrayOutputStream.)]
+       (loop [size 0]
+         (budget/check! operation)
+         (let [n (.read input scratch)]
+           (budget/check! operation)
+           (if (neg? n)
+             (.toByteArray output)
+             (do (budget/bound! operation :object-bytes (+ size n))
+                 (budget/charge! operation :content-read-bytes n)
+                 (.write output scratch 0 n)
+                 (recur (+ size n)))))))))
+
+#?(:clj
+   (defn- sync-binary [{:keys [input-stream blob] :as value} operation]
      (cond
-       (bytes/byte-buffer? value) value
-       (bytes/byte-buffer? input-stream) input-stream
-       input-stream (.readAllBytes ^java.io.InputStream input-stream)
-       (bytes/byte-buffer? blob) blob
+       (bytes/byte-buffer? value) (do (account-read! operation (bytes/length value)) value)
+       (bytes/byte-buffer? input-stream) (do (account-read! operation (bytes/length input-stream)) input-stream)
+       input-stream (if operation (bounded-stream input-stream operation)
+                        (.readAllBytes ^java.io.InputStream input-stream))
+       (bytes/byte-buffer? blob) (do (account-read! operation (bytes/length blob)) blob)
        :else (throw (ex-info "Unsupported Konserve binary value"
                              {:value-type (type value)})))))
 
@@ -137,15 +159,19 @@
        out)))
 
 #?(:cljs
-   (defn- async-binary [{:keys [input-stream blob] :as value}]
-     (cond
-       (bytes/byte-buffer? value) (value-channel value)
-       (bytes/byte-buffer? input-stream) (value-channel input-stream)
-       (bytes/byte-buffer? blob) (value-channel blob)
-       input-stream (stream-channel input-stream)
-       :else (value-channel
-              (ex-info "Unsupported Konserve binary value"
-                       {:value-type (type value)})))))
+   (defn- async-binary [{:keys [input-stream blob] :as value} operation]
+     (try
+       (cond
+         (bytes/byte-buffer? value) (do (account-read! operation (bytes/length value)) (value-channel value))
+         (bytes/byte-buffer? input-stream) (do (account-read! operation (bytes/length input-stream)) (value-channel input-stream))
+         (bytes/byte-buffer? blob) (do (account-read! operation (bytes/length blob)) (value-channel blob))
+         input-stream (if operation
+                        (budget/unsupported! operation :node-borrowed-stream)
+                        (stream-channel input-stream))
+         :else (value-channel
+                (ex-info "Unsupported Konserve binary value"
+                         {:value-type (type value)})))
+       (catch :default error (value-channel error)))))
 
 (defn get-bytes
   "Read a binary payload by content ID.
@@ -160,7 +186,8 @@
                    (async
                     (await
                      (execution/io-result
-                      (k/bget (:store @conn) id
-                              #?(:clj sync-binary :cljs async-binary)
-                              opts)
+                      (k/bget (:store (or (:read-db opts) @conn)) id
+                              #?(:clj #(sync-binary % (:merge-budget opts))
+                                 :cljs #(async-binary % (:merge-budget opts)))
+                              (dissoc opts :merge-budget :read-db :content-seen :content-depth))
                       opts))))))))

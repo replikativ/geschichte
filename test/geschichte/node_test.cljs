@@ -1,6 +1,9 @@
 (ns geschichte.node-test
   (:require [cljs.test :as test]
             [geschichte.async-node-test]
+            [geschichte.budget-test]
+            [geschichte.merge.bounded-delta-test]
+            [geschichte.merge.bounded-diff-test]
             [geschichte.chunk-test]
             [geschichte.content-node-test]
             [geschichte.content-range-node-test]
@@ -13,8 +16,9 @@
             [geschichte.git-wire-test]
             [geschichte.merge-core-test]
             [geschichte.merge.whitespace-test]
-            [geschichte.strict-utf8-test]
             [geschichte.merge.overlap-test]
+            [geschichte.strict-utf8-test]
+            [geschichte.budget-content-node-test]
             [geschichte.query-node-test]
             [geschichte.repo-node-test]
             [geschichte.tree-test]
@@ -29,6 +33,9 @@
 
 (defn -main [& _]
   (test/run-tests 'geschichte.async-node-test
+                  'geschichte.budget-test
+                  'geschichte.merge.bounded-delta-test
+                  'geschichte.merge.bounded-diff-test
                   'geschichte.chunk-test
                   'geschichte.content-node-test
                   'geschichte.content-range-node-test
@@ -41,8 +48,9 @@
                   'geschichte.git-wire-test
                   'geschichte.merge-core-test
                   'geschichte.merge.whitespace-test
-                  'geschichte.strict-utf8-test
                   'geschichte.merge.overlap-test
+                  'geschichte.strict-utf8-test
+                  'geschichte.budget-content-node-test
                   'geschichte.query-node-test
                   'geschichte.repo-node-test
                   'geschichte.tree-test
