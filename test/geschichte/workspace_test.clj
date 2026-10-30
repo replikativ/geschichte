@@ -367,3 +367,119 @@
               (is (= old (repo/refs observer)))))
           (finally (d/release observer))))
       (finally (cleanup f)))))
+
+(deftest create-only-publication-refuses-all-existing-refs
+  (let [{:keys [cfg canonical] :as f} (fixture)]
+    (try
+      (workspace/fork! canonical "only-publisher")
+      (let [worker (d/connect (assoc cfg :branch :geschichte.workspace/only-publisher))]
+        (try
+          (repo/write! worker "candidate.txt" (->bytes "candidate\n"))
+          (repo/stage-all! worker)
+          (let [tip (:geschichte.commit/id (repo/commit! worker {:message "candidate"}))
+                before-files (repo/worktree canonical)
+                result (workspace/publish! canonical worker {:ref "review" :commit tip :create-only? true})]
+            (is (true? (:created? result)))
+            (is (nil? (:old result)))
+            (is (= tip (:new result)))
+            (is (= before-files (repo/worktree canonical)))
+            (repo/branch! canonical "existing-review")
+            (d/transact canonical [{:geschichte.ref/name "refs/heads/unborn-review"}])
+            (doseq [ref ["review" "existing-review" "unborn-review"]]
+              (let [before @canonical
+                    failure (try (workspace/publish! canonical worker {:ref ref :commit tip :create-only? true})
+                                 nil (catch Exception e e))]
+                (is (= ::workspace/publication-ref-exists (:type (ex-data failure))))
+                (is (= before @canonical)))))
+          (finally (d/release worker))))
+      (finally (cleanup f)))))
+
+(deftest create-only-cannot-be-combined-with-force-before-source-access
+  (is (= ::workspace/invalid-publication-options
+         (:type (ex-data (try (workspace/publish! nil nil {:create-only? true :force? true})
+                              nil (catch Exception e e)))))))
+
+(deftest create-only-publication-refuses-a-racing-unborn-ref-in-the-writer
+  (let [{:keys [cfg canonical] :as f} (fixture)]
+    (try
+      (workspace/fork! canonical "only-publisher")
+      (let [worker (d/connect (assoc cfg :branch :geschichte.workspace/only-publisher))
+            merge-var (ns-resolve 'geschichte.workspace 'merge-data)
+            merge-data @merge-var after-creation (atom nil)]
+        (try
+          (repo/write! worker "candidate.txt" (->bytes "candidate\n"))
+          (repo/stage-all! worker)
+          (let [tip (:geschichte.commit/id (repo/commit! worker {:message "candidate"}))
+                failure (with-redefs-fn
+                          {merge-var (fn [conn parents tx]
+                                       (d/transact canonical [{:geschichte.ref/name "refs/heads/review"}])
+                                       (reset! after-creation @canonical)
+                                       (merge-data conn parents tx))}
+                          #(try (workspace/publish! canonical worker
+                                                    {:ref "review" :commit tip :create-only? true})
+                                nil (catch Exception e e)))]
+            (is (= ::workspace/publication-ref-exists (:type (ex-data failure))))
+            (is (= @after-creation @canonical) "The losing transfer is rolled back with its ref update")
+            (is (contains? (repo/refs canonical) "refs/heads/review"))
+            (is (nil? (get (repo/refs canonical) "refs/heads/review"))))
+          (finally (d/release worker))))
+      (finally (cleanup f)))))
+
+(deftest publication-profile-positively-identifies-the-create-only-contract
+  (is (= {:id ::workspace/guarded-publication :version 1 :create-only? true :expected-checkpoint? true}
+         (workspace/publication-profile))))
+
+(deftest expected-publication-checkpoint-refuses-before-projection
+  (let [{:keys [canonical] :as f} (fixture)]
+    (try
+      (let [before @canonical calls (atom 0)
+            forbidden (fn [& _] (swap! calls inc) (throw (AssertionError. "Projection started")))
+            failure (with-redefs-fn
+                      {#'query/refs forbidden #'repo/current-ref forbidden
+                       #'workspace/commit-index forbidden #'repo/tree-at forbidden}
+                      #(try (workspace/publish! canonical nil {:expected-checkpoint (random-uuid)})
+                            nil (catch Exception e e)))]
+        (is (= ::workspace/stale-publication (:type (ex-data failure))))
+        (is (zero? @calls))
+        (is (= before @canonical)))
+      (finally (cleanup f)))))
+
+(deftest invalid-expected-publication-checkpoints-refuse-before-source-access
+  (doseq [value [nil "invalid" 1]]
+    (is (= ::workspace/invalid-publication-options
+           (:type (ex-data (try (workspace/publish! nil nil {:expected-checkpoint value})
+                                nil (catch Exception e e))))))))
+
+(deftest expected-publication-checkpoint-guards-the-complete-writer-transaction
+  (let [{:keys [cfg canonical] :as f} (fixture)]
+    (try
+      (workspace/fork! canonical "checkpoint-publisher")
+      (let [worker (d/connect (assoc cfg :branch :geschichte.workspace/checkpoint-publisher))
+            merge-var (ns-resolve 'geschichte.workspace 'merge-data)
+            merge-data @merge-var after-edit (atom nil)]
+        (try
+          (repo/write! worker "candidate.txt" (->bytes "candidate\n"))
+          (repo/stage-all! worker)
+          (let [tip (:geschichte.commit/id (repo/commit! worker {:message "candidate"}))
+                expected (d/commit-id @canonical)
+                failure (with-redefs-fn
+                          {merge-var (fn [conn parents tx]
+                                       (repo/set-config! canonical "user.raced" "true")
+                                       (reset! after-edit @canonical)
+                                       (merge-data conn parents tx))}
+                          #(try (workspace/publish! canonical worker
+                                                    {:ref "guarded-review" :commit tip :create-only? true
+                                                     :expected-checkpoint expected})
+                                nil (catch Exception e e)))]
+            (is (= ::workspace/stale-publication (:type (ex-data failure))))
+            (is (= expected (:expected-checkpoint (ex-data failure))))
+            (is (= @after-edit @canonical))
+            (is (not (contains? (repo/refs canonical) "refs/heads/guarded-review")))
+            (let [result (workspace/publish! canonical worker
+                                             {:ref "guarded-review" :commit tip :create-only? true
+                                              :expected-checkpoint (d/commit-id @canonical)})]
+              (is (true? (:created? result)))
+              (is (= tip (:new result)))
+              (is (= (d/commit-id @after-edit) (:expected-checkpoint result)))))
+          (finally (d/release worker))))
+      (finally (cleanup f)))))

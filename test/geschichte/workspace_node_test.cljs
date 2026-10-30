@@ -84,6 +84,24 @@
                                            "node.txt"))))]
                      (is (= (:geschichte.commit/id commit) (:new published)))
                      (is (= "node\n" (bytes/decode-utf8 historical)))
+                     (let [created (bridge/unwrap-result
+                                    (<! (take-cps
+                                         (workspace/publish! canonical worker
+                                                             {:ref "node-review" :create-only? true
+                                                              :expected-checkpoint (d/commit-id @canonical)
+                                                              :commit (:geschichte.commit/id commit)}))))
+                           before @canonical
+                           failure (try
+                                     (bridge/unwrap-result
+                                      (<! (take-cps
+                                           (workspace/publish! canonical worker
+                                                               {:ref "node-review" :create-only? true
+                                                                :commit (:geschichte.commit/id commit)}))))
+                                     nil (catch :default error error))]
+                       (is (true? (:created? created)))
+                       (is (= (:geschichte.commit/id commit) (:new created)))
+                       (is (= ::workspace/publication-ref-exists (:type (ex-data failure))))
+                       (is (= before @canonical)))
                      (let [observer (<! (d/connect
                                          (assoc cfg :branch :geschichte.workspace/node-observer)
                                          {:sync? false}))]
@@ -187,3 +205,26 @@
                (finally
                  (<! (d/delete-database cfg))
                  (done)))))))
+
+(deftest node-create-only-force-refuses-before-source-access
+  (async done
+         (go
+           (try
+             (let [failure (try
+                             (bridge/unwrap-result
+                              (<! (take-cps (workspace/publish! nil nil {:create-only? true :force? true}))))
+                             nil (catch :default error error))]
+               (is (= ::workspace/invalid-publication-options (:type (ex-data failure)))))
+             (finally (done))))))
+
+(deftest node-invalid-publication-checkpoint-refuses-before-source-access
+  (async done
+         (go
+           (try
+             (doseq [value [nil "invalid"]]
+               (let [failure (try
+                               (bridge/unwrap-result
+                                (<! (take-cps (workspace/publish! nil nil {:expected-checkpoint value}))))
+                               nil (catch :default error error))]
+                 (is (= ::workspace/invalid-publication-options (:type (ex-data failure))))))
+             (finally (done))))))

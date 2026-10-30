@@ -346,6 +346,20 @@
   [[:db.fn/cas eid :geschichte.ref/target
     (when old [:geschichte.commit/id old]) [:geschichte.commit/id tip]]])
 
+(defn- guarded-publication-tx [db expected tx-data]
+  ;; O(1): never enumerate a raced, potentially larger target in the writer.
+  (when-not (= expected (d/commit-id db))
+    (throw (ex-info "Canonical checkpoint changed while preparing publication"
+                    {:type ::stale-publication :expected-checkpoint expected
+                     :checkpoint (d/commit-id db)})))
+  tx-data)
+
+(defn publication-profile
+  "Positive compatibility marker: consumers must not send create-only options
+  to an older runtime that could ignore them. This grants no publication rights."
+  []
+  {:id ::guarded-publication :version 1 :create-only? true :expected-checkpoint? true})
+
 (defn publish!
   "Publish one logical workspace ref into a canonical Geschichte connection.
 
@@ -353,7 +367,15 @@
   ref again inside the serialized Datahike merge transaction, and newly created
   refs validate absence there, so concurrent publishers cannot silently
   overwrite each other. `:force? true` permits a
-  deliberate non-fast-forward update.
+  deliberate non-fast-forward update. `:create-only? true` requires a missing
+  ref and validates that absence again in the serialized transaction; it also
+  allows creation without `:create?`. Existing refs, including unborn refs or
+  the same tip, refuse. It cannot be combined with `:force?`.
+
+  Optional `:expected-checkpoint` must name the canonical Datahike commit. It
+  is checked before metadata projection and again in the serialized writer,
+  allowing callers to preflight finite bounds on the exact target snapshot.
+  The caller must separately own/exclude concurrent writes to the workspace.
 
   Only reachable immutable commit metadata and the selected ref are copied to
   the canonical current DB. The workspace's worktree, index, config, and other
@@ -361,13 +383,23 @@
   keeps every published Geschichte snapshot and store-ref blob reachable after
   the physical workspace branch is removed."
   ([canonical workspace] (publish! canonical workspace {}))
-  ([canonical workspace {:keys [ref commit force? create?]
-                         :or {force? false create? false}}]
+  ([canonical workspace {:keys [ref commit force? create? create-only? expected-checkpoint]
+                         :or {force? false create? false create-only? false} :as options}]
    (platform-async
-    (let [ref (normalize-ref (or ref (repo/current-ref workspace)))
+    (let [_ (when (and (contains? options :expected-checkpoint) (not (uuid? expected-checkpoint)))
+              (throw (ex-info "Expected publication checkpoint must be a UUID"
+                              {:type ::invalid-publication-options})))
+          _ (when (and force? create-only?)
+              (throw (ex-info "Create-only publication cannot force an existing ref"
+                              {:type ::invalid-publication-options})))
           canonical-db @canonical
+          _ (when expected-checkpoint (guarded-publication-tx canonical-db expected-checkpoint []))
+          ref (normalize-ref (or ref (repo/current-ref workspace)))
           canonical-ref (get (query/refs canonical-db) ref ::missing)
-          _ (when (and (= ::missing canonical-ref) (not create?))
+          _ (when (and create-only? (not= ::missing canonical-ref))
+              (throw (ex-info "Create-only publication requires an absent ref"
+                              {:type ::publication-ref-exists :ref ref})))
+          _ (when (and (= ::missing canonical-ref) (not (or create? create-only?)))
               (throw (ex-info "Canonical ref does not exist"
                               {:ref ref})))
           canonical-ref (when-not (= ::missing canonical-ref) canonical-ref)
@@ -400,16 +432,21 @@
                        :else
                        [:db.fn/call update-publication-ref-tx ref ref-entity canonical-ref tip])
           workspace-head (d/commit-id @workspace)
-          tx-data (conj (:tx-data transfer) ref-update)]
+          tx-data (conj (:tx-data transfer) ref-update)
+          tx-data (if expected-checkpoint
+                    [[:db.fn/call guarded-publication-tx expected-checkpoint tx-data]]
+                    tx-data)]
       (path-tree/assert-valid! tree)
       (await (merge-data canonical #{workspace-head} tx-data))
-      {:ref ref
-       :old canonical-ref
-       :new tip
-       :copied-commits (count (:copied-commits transfer))
-       :copied-content (count (:copied-content transfer))
-       :workspace-commit workspace-head
-       :forced? force?}))))
+      (cond-> {:ref ref
+               :old canonical-ref
+               :new tip
+               :copied-commits (count (:copied-commits transfer))
+               :copied-content (count (:copied-content transfer))
+               :workspace-commit workspace-head
+               :forced? force?}
+        create-only? (assoc :created? true)
+        expected-checkpoint (assoc :expected-checkpoint expected-checkpoint))))))
 
 (defn- retract-entities [db attr]
   (mapv (fn [[eid]] [:db/retractEntity eid])
